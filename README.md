@@ -11,6 +11,22 @@ AIGC:
 
 # 洛书匣 · TavernLib
 
+## 下载安装（Windows 10 / 11，小白直接看这里）
+
+**➡️ 点这里下载 exe 安装包：[TavernLib-Setup-1.0.0.exe](https://github.com/Rokii-77/TavernLib/releases/download/v1.0.0/TavernLib-Setup-1.0.0.exe)**（约 81 MB）
+
+安装步骤：
+
+1. 点上面这个链接，下载 `TavernLib-Setup-1.0.0.exe`
+2. 双击运行，选择安装位置，一路下一步
+3. 装完桌面会出现「洛书匣」图标，双击打开就能用
+
+> 安装包没有做数字签名，如果 Windows 弹出「已保护你的电脑」，点**更多信息 → 仍要运行**即可。
+
+**普通用户只需要下载上面那个 exe，其余文件都是源码，不用管。** 所有历史版本见 [Release 下载页](https://github.com/Rokii-77/TavernLib/releases/latest)。
+
+---
+
 面向 SillyTavern（酒馆）的本地资料库管理器。把散落在各种网盘、DC 帖子、酒馆目录里的**角色卡、世界书、预设、美化主题**收拢到一处集中管理，带导入、分类、查重、比对更新、备份与回退。
 
 - 桌面端：Electron 33 + Vue 3 + Vite
