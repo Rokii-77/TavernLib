@@ -1,0 +1,9 @@
+/* 洛书匣 · 酒馆实时同步：面板样式，尺寸与酒馆其他扩展保持一致 */
+.luoshu-sync-row{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;padding:2px 0;}
+.luoshu-sync-row .checkbox_label{margin:0;}
+.luoshu-sync-meta{display:inline-flex;align-items:center;gap:10px;white-space:nowrap;}
+.luoshu-sync-state{display:inline-flex;align-items:center;gap:6px;font-size:.9em;opacity:.9;white-space:nowrap;}
+.luoshu-sync-dot{width:8px;height:8px;border-radius:50%;background:#8a8a8a;display:inline-block;flex:0 0 auto;}
+.luoshu-sync-state.on .luoshu-sync-dot{background:#3ec46d;}
+.luoshu-sync-state.off .luoshu-sync-dot{background:#8a8a8a;}
+.luoshu-sync-ver{font-size:.85em;opacity:.6;letter-spacing:.2px;font-variant-numeric:tabular-nums;}

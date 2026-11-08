@@ -1,0 +1,154 @@
+:root {
+  --bg: #0f1114;
+  --bg-2: #14171c;
+  --panel: #1b1f25;
+  --panel-2: #22272f;
+  --panel-3: #2a3038;
+  --line: #2c323b;
+  --line-soft: #242a32;
+  --text: #e7e9ec;
+  --text-2: #b7bec9;
+  --muted: #828c9a;
+  --accent: #d4a24c;
+  --accent-2: #f0c675;
+  --accent-dim: rgba(212, 162, 76, 0.14);
+  --ok: #4fb383;
+  --danger: #d2604f;
+  --radius: 10px;
+  --shadow: 0 8px 24px rgba(0, 0, 0, 0.38);
+
+  /* 日夜切换用到的几个复合色（组件里直接引用，切主题时一起变） */
+  --topbar-bg: linear-gradient(180deg, rgba(28, 32, 39, 0.94), rgba(20, 23, 28, 0.94));
+  --tabbar-bg: rgba(15, 17, 20, 0.6);
+  --overlay-1: rgba(255, 255, 255, 0.05);
+  --overlay-2: rgba(255, 255, 255, 0.04);
+  /* 弹窗遮罩 / 实体面板 / 浮动层（右键菜单、气泡、任务条）底色 */
+  --mask: rgba(6, 8, 10, 0.62);
+  --panel-solid: #191d23;
+  --panel-fly: rgba(31, 36, 43, 0.97);
+  --scroll-thumb: #333a44;
+  --scroll-thumb-hover: #454e5b;
+  --body-glow-1: rgba(212, 162, 76, 0.07);
+  --body-glow-2: rgba(93, 132, 214, 0.06);
+}
+
+/* 日间主题：只换变量，结构 / 布局 / 交互一律不动 */
+:root[data-theme="light"] {
+  --bg: #f4f5f7;
+  --bg-2: #eceef2;
+  --panel: #ffffff;
+  --panel-2: #f3f5f8;
+  --panel-3: #e8ebf0;
+  --line: #d5dae2;
+  --line-soft: #e4e8ee;
+  --text: #1c2128;
+  --text-2: #3f4855;
+  --muted: #6d7683;
+  --accent: #b8823a;
+  --accent-2: #d9a758;
+  --accent-dim: rgba(184, 130, 58, 0.13);
+  --ok: #2f8f61;
+  --danger: #c0533f;
+  --shadow: 0 8px 22px rgba(23, 28, 38, 0.12);
+
+  --topbar-bg: linear-gradient(180deg, #ffffff, #f0f2f6);
+  --tabbar-bg: rgba(232, 236, 242, 0.9);
+  --overlay-1: rgba(20, 24, 32, 0.07);
+  --overlay-2: rgba(20, 24, 32, 0.05);
+  --mask: rgba(23, 28, 38, 0.32);
+  --panel-solid: #ffffff;
+  --panel-fly: rgba(255, 255, 255, 0.97);
+  --scroll-thumb: #c4cad4;
+  --scroll-thumb-hover: #a9b1bd;
+  --body-glow-1: rgba(212, 162, 76, 0.10);
+  --body-glow-2: rgba(93, 132, 214, 0.08);
+}
+
+* { box-sizing: border-box; }
+
+html, body, #app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background:
+    radial-gradient(1100px 600px at 12% -10%, var(--body-glow-1), transparent 60%),
+    radial-gradient(900px 500px at 100% 0%, var(--body-glow-2), transparent 55%),
+    var(--bg);
+  color: var(--text);
+  font-family: "HarmonyOS Sans SC", "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", system-ui, -apple-system, sans-serif;
+  font-size: 13.5px;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  user-select: none;
+}
+
+button {
+  font-family: inherit;
+  font-size: inherit;
+  color: var(--text-2);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 12px;
+  cursor: pointer;
+  transition: all 0.16s ease;
+  white-space: nowrap;
+}
+button:hover { color: var(--text); border-color: var(--line); background: var(--panel-3); }
+button:active { transform: translateY(1px); }
+button.primary {
+  color: #20180a;
+  background: linear-gradient(180deg, var(--accent-2), var(--accent));
+  border-color: transparent;
+  font-weight: 600;
+}
+button.primary:hover { filter: brightness(1.06); }
+button.ghost { background: transparent; }
+
+input {
+  font-family: inherit;
+  font-size: inherit;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 11px;
+  outline: none;
+  transition: border-color 0.16s ease;
+}
+input::placeholder { color: var(--muted); }
+input:focus { border-color: rgba(212, 162, 76, 0.55); }
+
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--scroll-thumb);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--scroll-thumb-hover); background-clip: content-box; }
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  color: var(--muted);
+  background: var(--panel-2);
+  border: 1px solid var(--line-soft);
+}
+.chip.gold {
+  color: var(--accent-2);
+  background: var(--accent-dim);
+  border-color: rgba(212, 162, 76, 0.32);
+}
+.chip.ok {
+  color: var(--ok);
+  background: rgba(79, 179, 131, 0.1);
+  border-color: rgba(79, 179, 131, 0.3);
+}
