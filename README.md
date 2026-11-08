@@ -11,7 +11,7 @@ AIGC:
 
 # 洛书匣 · TavernLib
 
-## 下载安装（Windows 10 / 11，小白直接看这里）
+## 下载安装（Windows 10 / 11）
 
 **➡️ 点这里下载 exe 安装包：[TavernLib-Setup-1.0.0.exe](https://github.com/Rokii-77/TavernLib/releases/download/v1.0.0/TavernLib-Setup-1.0.0.exe)**（约 81 MB）
 
