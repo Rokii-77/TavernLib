@@ -13,7 +13,7 @@ AIGC:
 
 ## 下载安装（Windows 10 / 11）
 
-**➡️ 点这里下载 exe 安装包：[TavernLib-Setup-1.0.0.exe](https://github.com/Rokii-77/TavernLib/releases/download/v1.0.0/TavernLib-Setup-1.0.0.exe)**（约 81 MB）
+**➡️ 点这里下载 exe 安装包：[https://github.com/Rokii-77/TavernLib/releases/download/v1.0.1/TavernLib-Setup-1.0.1.exe)**（约 81 MB）
 
 安装步骤：
 
