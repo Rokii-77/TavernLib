@@ -13,11 +13,11 @@ AIGC:
 
 ## 下载安装（Windows 10 / 11）
 
-**⬇️ 下载安装包：[TavernLib-Setup-1.0.3.exe](https://github.com/Rokii-77/TavernLib/releases/download/v1.0.3/TavernLib-Setup-1.0.3.exe)**（85,895,123 字节 / 81.92 MB）
+**➡️ 点这里下载 exe 安装包：[TavernLib-Setup-1.0.4.exe](https://github.com/Rokii-77/TavernLib/releases/download/v1.0.4/TavernLib-Setup-1.0.4.exe)**（85,901,812 字节 / 81.92 MB）
 
 安装步骤：
 
-1. 点上面这个链接，下载 `TavernLib-Setup-1.0.3.exe`
+1. 点上面这个链接，下载 `TavernLib-Setup-1.0.4.exe`
 2. 双击运行，选择安装位置，一路下一步
 3. 装完桌面会出现「洛书匣」图标，双击打开就能用
 
@@ -31,7 +31,7 @@ AIGC:
 
 - 桌面端：Electron 33 + Vue 3 + Vite
 - 平台：Windows 10 / 11（x64）
-- 当前版本：1.0.3
+- 当前版本：1.0.4
 
 ---
 
