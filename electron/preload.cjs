@@ -57,6 +57,8 @@ contextBridge.exposeInMainWorld('api', {
   stScanWorldsUnbound: (opts) => ipcRenderer.invoke('st:scanWorldsUnbound', opts || {}),
   stScanPresets: (opts) => ipcRenderer.invoke('st:scanPresets', opts || {}),
   stScanThemes: (opts) => ipcRenderer.invoke('st:scanThemes', opts || {}),
+  /* 只为指定文件算内容指纹：详情页对比「酒馆当前版本」用，避免全库重扫 */
+  stProbeDigests: (opts) => ipcRenderer.invoke('st:probeDigests', opts || {}),
   stUiCss: (opts) => ipcRenderer.invoke('st:uiCss', opts || {}),
   stFaFont: (opts) => ipcRenderer.invoke('st:faFont', opts || {}),
   stThemeSrc: (opts) => ipcRenderer.invoke('st:themeSrc', opts || {}),
@@ -109,6 +111,13 @@ contextBridge.exposeInMainWorld('api', {
     const h = (_e, v) => { try { fn(v || {}) } catch (_) {} }
     ipcRenderer.on('up:progress', h)
     return () => ipcRenderer.removeListener('up:progress', h)
+  },
+
+  /* 切换数据目录时的整库迁移进度 */
+  onDataMigrateProgress: (fn) => {
+    const h = (_e, v) => { try { fn(v || {}) } catch (_) {} }
+    ipcRenderer.on('data:migrateProgress', h)
+    return () => ipcRenderer.removeListener('data:migrateProgress', h)
   },
 
   /* 本机通知桥 */

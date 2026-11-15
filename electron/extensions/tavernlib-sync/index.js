@@ -4,7 +4,7 @@
    2026-11-08：桥端口改为 7799-7809 自动探测；支持 world / preset 刷新；面板显示扩展版本号。
    1.5.0：轮询失败退避 1.5s→3s→6s 封顶，失败时清端口缓存重新扫 7799-7809，成功立刻回 1.5s。 */
 
-const VERSION = '1.0.0'
+const VERSION = '1.1.0'
 const PORT_START = 7799
 const PORT_END = 7809
 /* 轮询退避：正常 1.5 秒；请求失败依次退到 3 秒、6 秒、12 秒并封顶，成功一次立刻回到 1.5 秒
@@ -188,11 +188,113 @@ async function refreshWorldInfo(name) {
   await emitEvent(['WORLDINFO_UPDATED', 'WORLD_INFO_UPDATED'], name || undefined)
 }
 
-async function refreshPreset(name) {
+/* ---------- 预设列表真正更新：酒馆前端把预设缓存在内存里，光发事件没人重读 ----------
+ * 查过酒馆源码（public/scripts/openai.js）：PRESET_CHANGED / OAI_PRESET_CHANGED 只在
+ * 「应用预设」时发出，前端没有任何监听方去重新 readdir 预设目录、重建下拉；
+ * 预设列表只在 loadOpenAISettings() 里由 /api/settings/get 的返回重建。
+ * 所以「新建预设后要刷新页面」的根因不是事件没发出去，而是酒馆没有「重读预设列表」的口子。
+ * 唯一正规途径：调酒馆自己的设置加载函数（等同刷新页面时做的那一遍，但只重载设置、不动聊天）。
+ * 代价：要拉一次 /api/settings/get（含全部预设内容，本地请求），因此做并发保护、不重复触发。 */
+let presetReloading = false
+let presetReloadPending = false
+
+function normEngine(s) {
+  return String(s || '').toLowerCase().replace(/[\s_\-]+/g, '')
+}
+
+async function getRequestHeadersSafe() {
+  try {
+    const mod = await import('../../../../script.js')
+    if (mod && typeof mod.getRequestHeaders === 'function') return mod.getRequestHeaders()
+  } catch (_) {}
+  const c = getCtx()
+  try {
+    if (c && typeof c.getRequestHeaders === 'function') return c.getRequestHeaders()
+  } catch (_) {}
+  return { 'Content-Type': 'application/json' }
+}
+
+async function fetchSettingsData() {
+  const headers = await getRequestHeadersSafe()
+  const r = await fetch('/api/settings/get', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({}),
+    cache: 'no-store',
+  })
+  if (!r.ok) throw new Error('/api/settings/get ' + r.status)
+  return await r.json()
+}
+
+/** 让酒馆重读某一类引擎的预设列表；engine 用酒馆目录名（OpenAI / TextGenerationWebUI / KoboldAI / NovelAI） */
+async function reloadPresetList(engine) {
+  const data = await fetchSettingsData()
+  let api = normEngine(engine)
+  if (!api) {
+    /* 桥没带引擎时按酒馆当前主接口兜底；注意 /api/settings/get 的 settings 是字符串 */
+    try {
+      const s = typeof data.settings === 'string' ? JSON.parse(data.settings) : data.settings
+      api = normEngine(s && s.main_api)
+    } catch (_) {}
+  }
+  /* OpenAI 预设目录被所有 chat completion 类接口共用（claude / groq / deepseek / openrouter…） */
+  if (!api || /^(openai|claude|makersuite|vertexai|mistralai|cohere|perplexity|groq|deepseek|xai|ai21|together|openrouter|infermaticai|electronhub|custom|google|scale|dreamgen)$/.test(api)) {
+    const mod = await import('../../../../scripts/openai.js')
+    mod.loadOpenAISettings(data, mod.oai_settings)
+    return 'openai'
+  }
+  if (/(textgenerationwebui|ooba|tabby|ollama|llamacpp|vllm|mancer)/.test(api)) {
+    /* 酒馆的 loadTextGenSettings 只 append 不清空下拉，重复调用会堆出重复条目，这里先清空 */
+    try {
+      window.jQuery('#settings_preset_textgenerationwebui').empty()
+    } catch (_) {}
+    const mod = await import('../../../../scripts/textgen-settings.js')
+    await mod.loadTextGenSettings(data, { textgenerationwebui_settings: mod.textgenerationwebui_settings })
+    return 'textgenerationwebui'
+  }
+  if (/kobold/.test(api)) {
+    const mod = await import('../../../../scripts/kai-settings.js')
+    mod.loadKoboldSettings(data, mod.kai_settings, mod.kai_settings)
+    return 'kobold'
+  }
+  if (/novel/.test(api)) {
+    const mod = await import('../../../../scripts/nai-settings.js')
+    mod.loadNovelSettings(data, mod.nai_settings)
+    return 'novel'
+  }
+  const mod = await import('../../../../scripts/openai.js')
+  mod.loadOpenAISettings(data, mod.oai_settings)
+  return 'openai'
+}
+
+async function doReloadPresetList(engine, name) {
+  if (presetReloading) {
+    presetReloadPending = true
+    return
+  }
+  presetReloading = true
+  try {
+    const which = await reloadPresetList(engine)
+    console.info('[洛书匣] 已重载 ' + which + ' 预设列表' + (name ? '：' + name : ''))
+  } catch (e) {
+    console.warn('[洛书匣] 重载预设列表失败（酒馆端仍可用刷新页面兜底）', e)
+  } finally {
+    presetReloading = false
+    if (presetReloadPending) {
+      presetReloadPending = false
+      doReloadPresetList(engine, name)
+    }
+  }
+}
+
+async function refreshPreset(name, engine) {
   const now = Date.now()
   if (now - lastPresetAt < 500) return
   lastPresetAt = now
+  /* ① 先照旧发事件：有第三方扩展监听时让它做自己的事，行为向后兼容 */
   await emitEvent(['PRESET_CHANGED', 'OAI_PRESET_CHANGED_AFTER', 'OAI_PRESET_CHANGED'], name || undefined)
+  /* ② 再把新预设真正塞进酒馆下拉：走酒馆自己的设置加载（事件没人重读列表） */
+  await doReloadPresetList(engine, name)
 }
 
 /* ---------- 上报「酒馆当前在用哪张卡 / 哪个版本」----------
@@ -279,7 +381,7 @@ async function poll() {
           }, 400)
         }
         if (hasWorld) await refreshWorldInfo(j.name || '')
-        if (hasPreset) await refreshPreset(j.name || '')
+        if (hasPreset) await refreshPreset(j.name || '', j.engine || j.presetEngine || '')
       }
     }
     return true

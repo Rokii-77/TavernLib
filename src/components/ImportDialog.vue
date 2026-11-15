@@ -133,9 +133,10 @@ function applyTitleToRow(row, title) {
       if (m) row.model = m
       else autofillModel(row, t)
     }
-  } else if (row.nameAuto !== false) {
+  } else if (row.nameAuto !== false && row.nameSource !== 'card') {
     row.name = t
     row.nameAuto = false
+    row.nameSource = 'post'
   }
 }
 
@@ -208,7 +209,11 @@ async function addByLinks() {
 
       for (const row of added) {
         const src = files.find((x) => x.url === row.dlUrl)
-        if (src?.alias) row.name = src.alias
+        if (src?.alias) {
+          row.name = src.alias
+          row.nameAuto = false
+          row.nameSource = 'user'
+        }
         if (!row.version) row.version = defaultVersionName(row.category, row.payload, row.fileName)
         if (!row.date) row.date = dateFromPayload(row.category, row.payload)
         if (row.payload && !row.sig) row.sig = sigOfPayload(row.category, row.payload)
@@ -230,7 +235,11 @@ async function addByLinks() {
       const t = targets.find((r) => !r.dcUrl)
       if (!t) break
       t.dcUrl = p.url
-      if (p.alias) t.name = p.alias
+      if (p.alias) {
+        t.name = p.alias
+        t.nameAuto = false
+        t.nameSource = 'user'
+      }
       assigned.push({ post: p, row: t })
     }
     if (posts.length && assigned.length < posts.length) {
@@ -537,10 +546,12 @@ async function doImport() {
       })
       const names = (r.dupNames || []).slice(0, 3).join('、')
       patchBgJob({ label: '导入完成', done: total, total })
+      /* 空壳跳过要明说：备份包里正文全空的世界书/预设等不建条目，用户得知道为什么数目对不上 */
+      const skip = r.skippedEmpty ? `，跳过 ${r.skippedEmpty} 个空壳条目（备份包里本身没有内容）` : ''
       showToast(
         r.dup
-          ? `该版本已存在，已跳过 ${r.dup} 项${names ? `：${names}${r.dup > 3 ? ' 等' : ''}` : ''}；新增 ${r.created} 项`
-          : `导入完成：新增 ${r.created} 项，并入已有 ${r.merged} 项`
+          ? `该版本已存在，已跳过 ${r.dup} 项${names ? `：${names}${r.dup > 3 ? ' 等' : ''}` : ''}；新增 ${r.created} 项${skip}`
+          : `导入完成：新增 ${r.created} 项，并入已有 ${r.merged} 项${skip}`
       )
     } catch (e) {
       showToast('导入失败：' + (e.message || e))
@@ -843,7 +854,7 @@ async function confirmStImport() {
               </select>
             </span>
             <span class="c-name">
-              <input v-model="r.name" :disabled="!!r.error" @input="r.nameAuto = false" />
+              <input v-model="r.name" :disabled="!!r.error" @input="r.nameAuto = false; r.nameSource = 'user'" />
               <!-- 预设：模型名自动识别后可改；导入后显示在卡片备注下方 -->
               <input
                 v-if="r.category === 'presets'"

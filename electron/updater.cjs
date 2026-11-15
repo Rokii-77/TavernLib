@@ -147,7 +147,7 @@ function currentInstallInfo() {
   return { exePath, installDir }
 }
 
-ipcMain.handle('up:download', async (_e, { url, name, sha256 } = {}) => {
+ipcMain.handle('up:download', async (_e, { url, name, sha256, size } = {}) => {
   const u = safeHttpsUrl(url)
   if (!u) return { ok: false, error: '下载地址不合法' }
 
@@ -166,16 +166,33 @@ ipcMain.handle('up:download', async (_e, { url, name, sha256 } = {}) => {
     return r
   }
 
-  if (sha256) {
-    const want = String(sha256).toLowerCase().replace(/^sha256:/, '')
-    if (want && r.sha256.toLowerCase() !== want) {
+  /* 校验策略（与渲染层 verify 级别对应）：
+     ① 有更新清单 sha256 → 严格比对，不一致直接删包报错（原有行为，不回退）
+     ② 没有清单但知道文件大小 → 降级为大小比对，不一致同样删包
+     ③ 都没有 → 放行，但在返回值里标明 verify='none' 让界面提示 */
+  const wantSha = String(sha256 || '').toLowerCase().replace(/^sha256:/, '').trim()
+  const wantSize = Number(size || 0)
+  let verify = 'none'
+  if (wantSha) {
+    if (String(r.sha256 || '').toLowerCase() !== wantSha) {
       try { fs.unlinkSync(target) } catch (_) {}
-      return { ok: false, error: '安装包校验失败（sha256 不一致），已删除' }
+      return { ok: false, error: '安装包校验失败（sha256 不一致），已删除', verify: 'sha256' }
     }
+    verify = 'sha256'
+  } else if (wantSize > 0) {
+    if (Number(r.size) !== wantSize) {
+      try { fs.unlinkSync(target) } catch (_) {}
+      return {
+        ok: false,
+        error: `安装包校验失败（大小不一致：期望 ${wantSize} 字节，实际 ${r.size} 字节），已删除`,
+        verify: 'size'
+      }
+    }
+    verify = 'size'
   }
 
   lastPkg = r.path
-  return { ok: true, path: r.path, size: r.size, sha256: r.sha256, name: fileName }
+  return { ok: true, path: r.path, size: r.size, sha256: r.sha256, name: fileName, verify }
 })
 
 ipcMain.handle('up:install', async (_e, { path: pkgPath, toVersion } = {}) => {

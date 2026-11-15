@@ -13,9 +13,9 @@ function b64ToUtf8(b64) {
 
 /** 提取 PNG 的 tEXt/iTXt 文本块（角色卡数据存在 chara / ccv3 关键字里） */
 export function pngTextChunks(arrayBuffer) {
-  const bytes = new Uint8Array(arrayBuffer)
+  const bytes = arrayBuffer instanceof Uint8Array ? arrayBuffer : new Uint8Array(arrayBuffer)
   for (let i = 0; i < 8; i++) if (bytes[i] !== PNG_SIG[i]) return null
-  const view = new DataView(arrayBuffer)
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
   const out = {}
   let off = 8
   while (off + 8 <= bytes.length) {
@@ -47,6 +47,79 @@ export function pngTextChunks(arrayBuffer) {
   return out
 }
 
+/** 从 PNG 二进制里解析内嵌角色卡（chara / ccv3 文本块）
+ *  洛书匣 / 酒馆导出的卡图本身就带完整卡，备份包里的 images/*.png 就是「完整卡」的唯一载体，
+ *  而目录里的 json 往往只是精简元数据 —— 导出侧兜底与导入侧取 payload 都靠这里。 */
+export function cardFromPngBuffer(arrayBuffer) {
+  const chunks = pngTextChunks(arrayBuffer)
+  const raw = chunks?.ccv3 || chunks?.chara
+  if (!raw) return null
+  try {
+    const json = JSON.parse(b64ToUtf8(raw))
+    return json && typeof json === 'object' ? json : null
+  } catch (_) {
+    return null
+  }
+}
+
+/* 角色卡正文的核心字段：名称 / 描述 / 人设 / 场景 / 开场白 / 示例对话 / 作者备注 / 系统提示 */
+const CORE_CARD_FIELDS = [
+  'name', 'char_name', 'description', 'personality', 'scenario',
+  'first_mes', 'mes_example', 'creator_notes', 'system_prompt', 'post_history_instructions'
+]
+
+/** 卡片内层数据：v2/v3 规范在 payload.data 里，v1 老卡直接摊平在顶层 */
+function cardBodyOf(payload) {
+  if (!payload || typeof payload !== 'object') return null
+  const d = payload.data && typeof payload.data === 'object' ? payload.data : payload
+  return d && typeof d === 'object' ? d : null
+}
+
+/**
+ * payload 完整度打分：字段越全、正文越长分数越高。
+ * 用途：同一版本既有备份包里的「精简 json」又有「png 内完整卡」时择优，
+ * 精简 json（只有 name/description）分数必然低于完整卡。
+ */
+export function payloadScore(category, payload) {
+  const d = cardBodyOf(payload)
+  if (!d) return 0
+  if (category && category !== 'characters') {
+    try {
+      return Object.keys(payload).length
+    } catch (_) {
+      return 0
+    }
+  }
+  let n = 0
+  for (const k of CORE_CARD_FIELDS) {
+    const v = d[k]
+    if (typeof v !== 'string' || !v.trim()) continue
+    /* 有内容就 +1，正文有一定长度（不是占位空壳）再 +1 */
+    n += v.trim().length >= 20 ? 2 : 1
+  }
+  const alt = Array.isArray(d.alternate_greetings) ? d.alternate_greetings.filter((x) => String(x || '').trim()).length : 0
+  n += Math.min(alt, 5)
+  const book = d.character_book || payload.character_book
+  if (book && book.entries) n += 1
+  return n
+}
+
+/** 角色卡是否「空壳」：既没有开场白也没有描述 —— 典型就是备份包里被剥掉正文的精简 json */
+export function isThinCharacterPayload(payload) {
+  const d = cardBodyOf(payload)
+  if (!d) return true
+  const first = String(d.first_mes || '').trim()
+  const desc = String(d.description || '').trim()
+  return !first && !desc
+}
+
+/** 两份 payload 择优：分数高的胜出；同分保留原来的（避免无意义替换） */
+export function pickRicherPayload(category, base, candidate) {
+  if (!candidate) return base
+  if (!base) return candidate
+  return payloadScore(category, candidate) > payloadScore(category, base) ? candidate : base
+}
+
 export function fileExt(name) {
   const m = /\.([a-z0-9]+)$/i.exec(name || '')
   return m ? m[1].toLowerCase() : ''
@@ -54,6 +127,18 @@ export function fileExt(name) {
 
 export function stripExt(name) {
   return (name || '').replace(/\.[a-z0-9]+$/i, '')
+}
+
+/**
+ * 与导出侧 backup.js 的 safeName 完全一致：版本名写进文件名前会把 \\ / : * ? " < > | 换成 _。
+ * 导入时要能反查出原始版本名（9/9 导出成 9_9），否则往返一次就多出一个重复版本。
+ */
+export function safeFileName(name) {
+  return String(name || 'untitled')
+    .replace(/[\\/:*?"<>|]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 80)
 }
 
 /** 从美化 CSS 的头部注释里取个名字，取不到就返回空（调用方回落到文件名） */
@@ -143,6 +228,17 @@ export function classifyJson(obj) {
     return { category: 'themes', kind: 'theme', name: root.name || '' }
   }
 
+  /* 洛书匣自己导出的美化：{ css, name, theme }。
+     这条曾经缺失，导致备份包里的美化在导入时被归进「其他」，CSS 全丢。 */
+  if (typeof root.css === 'string' && root.css.trim()) {
+    return { category: 'themes', kind: 'theme', name: root.name || '' }
+  }
+  /* 同一形状但 css 为空（被剥空的壳版本）：形状就是洛书匣美化，仍归 themes，
+     否则会另建一条同名「其他」条目，条目数凭空多出来。 */
+  if ('css' in root && 'theme' in root && (root.theme === null || typeof root.theme === 'object')) {
+    return { category: 'themes', kind: 'theme', name: root.name || '' }
+  }
+
   // 美化主题的另一种写法：json 里没有 CSS，只存颜色 / 模糊 / 头像形状等外观字段
   if (UI_THEME_KEYS.filter((k) => k in root).length >= 3) {
     return { category: 'themes', kind: 'ui-theme', name: root.name || '' }
@@ -169,8 +265,10 @@ export function classifyJson(obj) {
 export function themePayloadOf(json) {
   if (!json || typeof json !== 'object') return json
   const css = typeof json.customCSS === 'string' ? json.customCSS
-    : typeof json.custom_css === 'string' ? json.custom_css : ''
-  const theme = {}
+    : typeof json.custom_css === 'string' ? json.custom_css
+      /* 洛书匣自己导出的美化把样式存在 css 字段：漏了这一支，美化导回来 CSS 就清零 */
+      : typeof json.css === 'string' ? json.css : ''
+  const theme = json.theme && typeof json.theme === 'object' ? { ...json.theme } : {}
   for (const k of UI_THEME_KEYS) if (k in json) theme[k] = json[k]
   const hasTheme = Object.keys(theme).length >= 3
   return {
@@ -231,10 +329,13 @@ async function parseJsonFile(file) {
     return { error: 'JSON 解析失败：' + e.message }
   }
   const info = classifyJson(json)
+  /* 洛书匣导出的 json 带 tavernlib_item_name（原始条目名）：单文件重导入也要还原它，
+     否则「方亦楷2.0」这类卡内名会把同一条拆成两条。 */
+  const ownName = String(json?.tavernlib_item_name || '').trim()
   return {
     category: info.category,
     kind: info.kind,
-    name: info.name || stripExt(file.name),
+    name: ownName || info.name || stripExt(file.name),
     payload: info.category === 'themes' ? themePayloadOf(json) : json
   }
 }
@@ -301,6 +402,25 @@ async function parseZip(file) {
     }
     imgCache.set(path, out)
     return out
+  }
+
+  /** png 内嵌卡缓存：同一张图可能被多个 json（当前版 + 历史版）引用，只解析一次 */
+  const pngCardCache = new Map()
+
+  /** 读一张包内图片，解析它内嵌的完整卡；不是卡（纯封面）返回 null */
+  async function cardOfImage(path) {
+    if (!path) return null
+    if (pngCardCache.has(path)) return pngCardCache.get(path)
+    let card = null
+    try {
+      const zipFile = zip.file(path)
+      /* 只解析 png：jpg / webp 里没有文本块，读了也是白读 */
+      if (zipFile && /\.png$/i.test(path)) card = cardFromPngBuffer(await zipFile.async('arraybuffer'))
+    } catch (_) {
+      card = null
+    }
+    pngCardCache.set(path, card)
+    return card
   }
 
   /** 在某个目录的索引里挑图片（allowLoose：允许退到 cover / 唯一图片） */
@@ -381,18 +501,54 @@ async function parseZip(file) {
         const info = classifyJson(json)
         if (info.kind === 'unknown') continue
         const stem = stripExt(base)
+        /* 导出侧写入的条目名（tavernlib_item_name）：卡内 data.name 常带版本后缀（「方亦楷2.0」），
+           直接用它建条目会把同一条拆成两条，这里优先还原原始条目名。 */
+        const ownName = String(json.tavernlib_item_name || '').trim()
         const coverPath = pickImagePath(dir, stem, stem, !inHistory)
+        let payload = info.category === 'themes' ? themePayloadOf(json) : json
+        /* 备份包里的 json 常常只是精简元数据（无开场白 / 无世界书正文），
+           真正的完整卡藏在同一版本配套的 images/<hash>.png 里（chara / ccv3 块）。
+           这里把 png 解析出来的卡当作该版本 payload 的来源之一，按完整度择优：
+           精简 json 缺 first_mes 时一律不采用它，避免导入后再也读不到开场白。
+           注意：png 不额外生成版本行，只作为已有版本的正文来源。 */
+        if (info.category === 'characters') {
+          const fromImg = await cardOfImage(coverPath)
+          if (fromImg) {
+            const thin = isThinCharacterPayload(payload)
+            payload = thin ? fromImg : pickRicherPayload('characters', payload, fromImg)
+          }
+        }
         items.push({
           category: info.category,
           kind: info.kind,
-          name: info.name || stripExt(dir.split('/').pop() || base),
+          name: ownName || info.name || stripExt(dir.split('/').pop() || base),
           version: stem,
           isCurrent: !inHistory,
-          payload: info.category === 'themes' ? themePayloadOf(json) : json,
+          payload,
           cover: await imgDataUrl(coverPath),
           fromPath: path
         })
       } catch (_) {}
+    }
+  }
+
+  /* 版本名还原：导出侧把版本名里的非法字符换成了 _（「9/9」→「9_9」），
+     直接拿文件名当版本名，会让往返一次就多出一个内容完全相同的重复版本。
+     manifest 里存着原始版本名，按「同类别 + 同条目名」把文件名还原回去。 */
+  if (indexMeta && Array.isArray(indexMeta.entries)) {
+    const verIndex = new Map()
+    for (const e of indexMeta.entries) {
+      if (!e || !e.name) continue
+      const list = Array.isArray(e.versions) ? e.versions.filter(Boolean).map(String) : []
+      if (list.length) verIndex.set(`${e.category || ''}|${e.name}`, list)
+    }
+    for (const it of items) {
+      const cur = String(it.version || '')
+      if (!cur) continue
+      const list = verIndex.get(`${it.category}|${it.name}`)
+      if (!list || list.includes(cur)) continue
+      const hit = list.find((v) => safeFileName(v) === cur)
+      if (hit) it.version = hit
     }
   }
 
@@ -458,15 +614,34 @@ export function cardVersionOf(category, payload) {
   return ''
 }
 
+/* 名称来源：决定「抓到帖子标题后能不能改这一行的名字」。
+ *  'card' = 名字来自卡片内容（角色卡里的 name 字段），是作者定的名字，永不被帖子标题顶掉；
+ *  'file' = 由文件名派生（"5501f8a3" 这种没信息量的名字）。
+ *  帖子标题是整串营销语，绝不能顶掉卡片自带的角色名，只允许补文件名派生的名字。 */
+function nameSourceOf(row) {
+  const stem = stripExt(String(row.fileName || ''))
+  const nm = String(row.name || '').trim()
+  return nm && nm !== stem ? 'card' : 'file'
+}
+
 /** 导入行统一补齐「备注 / 卡片版本号」：版本名默认就用卡片自带的版本号，用户仍可在表格里改 */
 function decorateRow(row) {
   if (!row || row.error) return row
   try {
     const remark = cardRemarkOf(row.category, row.payload)
     const cardVersion = cardVersionOf(row.category, row.payload)
-    return { ...row, remark, cardVersion, version: String(row.version || '').trim() || cardVersion }
+    const nameSource = row.nameSource || nameSourceOf(row)
+    return {
+      ...row,
+      remark,
+      cardVersion,
+      nameSource,
+      /* nameAuto=true 才允许后续用帖子标题替换名称；卡片自带的角色名从一开始就是 false */
+      nameAuto: row.nameAuto === false ? false : nameSource === 'file',
+      version: String(row.version || '').trim() || cardVersion
+    }
   } catch (_) {
-    return { ...row, remark: '', cardVersion: '' }
+    return { ...row, remark: '', cardVersion: '', nameSource: row.nameSource || 'file' }
   }
 }
 

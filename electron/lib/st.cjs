@@ -7,6 +7,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const png = require('./png.cjs')
 const digest = require('./digest.cjs')
+const thumb = require('./thumb.cjs')
 
 /* ---------------- 目录 ---------------- */
 
@@ -17,12 +18,94 @@ function userDirs(tavernPath, user) {
     characters: path.join(root, 'characters'),
     worlds: path.join(root, 'worlds'),
     chats: path.join(root, 'chats'),
-    extensions: path.join(root, 'extensions')
+    extensions: path.join(root, 'extensions'),
+    /* 酒馆缩略图缓存：data/<user>/thumbnails/avatar/<avatar>.<fmt>，按 avatar 文件名一一对应。
+       首屏由酒馆前端懒生成（并发生成常失败），所以洛书匣写完卡后主动在这里落一份。 */
+    thumbnails: path.join(root, 'thumbnails', 'avatar')
   }
 }
 
 function exists(p) {
   try { return fs.existsSync(p) } catch (_) { return false }
+}
+
+/* ---------------- 真实用户目录解析 ----------------
+ * 酒馆的用户目录是 data/<user>/。settings.stUser 是历史遗留值（可能被重置成
+ * 一个根本不存在的名字，如 zztest），以前所有路径都直接拼它，于是扩展明明装在
+ * data/default-user 下也被判成「未安装」。
+ * 这里统一解析：优先传入值 → default-user → data 下真实存在的用户目录；
+ * 酒馆 config.yaml 里 enableUserAccounts: false 时酒馆只用 default-user，直接以它为准。
+ * 判定（extStatus）与写入（requireTavern / injectExt）都走这一份逻辑，避免再次漂移。 */
+
+/** 读酒馆 config.yaml 的多账号开关：true / false / null（读不到或没这一项 = 未知） */
+function userAccountsEnabled(tavernPath) {
+  try {
+    const p = path.join(String(tavernPath || ''), 'config.yaml')
+    if (!exists(p)) return null
+    const text = fs.readFileSync(p, 'utf8')
+    const m = text.match(/^[ \t]*enableUserAccounts[ \t]*:[ \t]*(true|false)/im)
+    if (!m) return null
+    return m[1].toLowerCase() === 'true'
+  } catch (_) {
+    return null
+  }
+}
+
+/** data 下真实存在的用户目录名（跳过 _cache / _uploads 这类系统目录） */
+function listUserDirs(tavernPath) {
+  const dataRoot = path.join(String(tavernPath || ''), 'data')
+  let subs = []
+  try { subs = fs.readdirSync(dataRoot, { withFileTypes: true }) } catch (_) { return [] }
+  const out = []
+  for (const d of subs) {
+    if (!d.isDirectory()) continue
+    if (d.name.startsWith('_') || d.name.startsWith('.')) continue
+    out.push(d.name)
+  }
+  return out
+}
+
+/**
+ * 解析实际使用的酒馆用户目录
+ * @returns {{user:string, want:string, corrected:boolean, dirs:object,
+ *            candidates:Array<{user:string, dirs:object}>, accounts:boolean|null}}
+ */
+function resolveUserDir(tavernPath, user) {
+  const tp = String(tavernPath || '')
+  const want = String(user || '').trim() || 'default-user'
+  const accounts = userAccountsEnabled(tp)
+  const order = []
+  const add = (u) => { if (u && !order.includes(u)) order.push(u) }
+  if (accounts === false) {
+    /* 酒馆没开多账号：任何非 default-user 的值都是死值，只认 default-user */
+    add('default-user')
+  } else {
+    add(want)
+    add('default-user')
+    for (const u of listUserDirs(tp)) add(u)
+  }
+  let hit = ''
+  for (const u of order) {
+    if (exists(path.join(tp, 'data', u))) { hit = u; break }
+  }
+  const picked = hit || (accounts === false ? 'default-user' : want)
+  return {
+    user: picked,
+    want,
+    corrected: picked !== want,
+    accounts,
+    dirs: userDirs(tp, picked),
+    candidates: order.map((u) => ({ user: u, dirs: userDirs(tp, u) }))
+  }
+}
+
+/** 扩展的历史安装位置（早期 GitHub 安装写的是 public/scripts/extensions/third-party） */
+function legacyExtRoots(tavernPath) {
+  const tp = String(tavernPath || '')
+  return [
+    path.join(tp, 'public', 'scripts', 'extensions', 'third-party'),
+    path.join(tp, 'public', 'extensions')
+  ]
 }
 
 function ensureDir(p) {
@@ -31,19 +114,31 @@ function ensureDir(p) {
 
 /** 写入前校验：酒馆目录必须真实存在（不自动创建，避免路径填错时在别处凭空生成空目录） */
 function requireTavern(tavernPath, user) {
-  const dirs = userDirs(tavernPath, user)
   const tp = String(tavernPath || '').trim()
-  if (!tp) return { ok: false, error: '还没设置酒馆安装路径（例如 D:\\SillyTavern）', dirs }
-  if (!exists(tp)) return { ok: false, error: '找不到酒馆目录：' + tp + '，请在设置里填写正确的酒馆安装路径', dirs }
+  if (!tp) return { ok: false, error: '还没设置酒馆安装路径（形如 F:\\SillyTavern）', dirs: userDirs(tavernPath, user) }
+  if (!exists(tp)) return { ok: false, error: '找不到酒馆目录：' + tp + '，请在设置里填写正确的酒馆安装路径', dirs: userDirs(tavernPath, user) }
+  /* stUser 可能是不存在的死值：这里统一回退到真实存在的用户目录，保证「判定」与「写入」同源 */
+  const rs = resolveUserDir(tp, user)
+  const dirs = rs.dirs
   if (!exists(dirs.root)) {
-    return { ok: false, error: '酒馆目录里找不到数据目录：' + dirs.root + '，请确认酒馆已至少启动过一次', dirs }
+    return {
+      ok: false,
+      error: '酒馆目录里找不到数据目录：' + dirs.root + '，请确认酒馆已至少启动过一次',
+      dirs,
+      user: rs.user
+    }
   }
   try {
     fs.accessSync(dirs.root, fs.constants.W_OK)
   } catch (_) {
-    return { ok: false, error: '没有写入权限：' + dirs.root + '，请检查目录权限或以管理员身份运行', dirs }
+    return {
+      ok: false,
+      error: '没有写入权限：' + dirs.root + '，请检查目录权限或以管理员身份运行',
+      dirs,
+      user: rs.user
+    }
   }
-  return { ok: true, dirs }
+  return { ok: true, dirs, user: rs.user, want: rs.want, corrected: rs.corrected }
 }
 
 /** 酒馆的文件名规则：去掉路径非法字符，保留中文与空格 */
@@ -64,7 +159,7 @@ function safeFile(name, fallback = 'untitled') {
  * opts.only = ['avatar1', ...] 时只解析这些文件（大小写不敏感）。
  * 之前无条件解析每张 PNG，是进书架卡顿的主因之一。 */
 function scanCharacters(tavernPath, user, opts = {}) {
-  const dirs = userDirs(tavernPath, user)
+  const dirs = resolveUserDir(tavernPath, user).dirs
   if (!exists(dirs.characters)) return { ok: false, error: '找不到角色卡目录：' + dirs.characters, dir: dirs.characters, list: [] }
   const out = []
   const light = !!opts.light
@@ -127,7 +222,7 @@ function scanCharacters(tavernPath, user, opts = {}) {
 /**
  * 只对指定的几个文件算内容指纹（对比酒馆当前加载的是哪一版用）
  * 与「全量扫描」相比，这里只读 1~N 个同名候选文件，进书架/进详情都不会卡。
- * opt = { kind: 'characters' | 'worldbooks' | 'presets', files: [{ path, name, engine }] }
+ * opt = { kind: 'characters' | 'worldbooks' | 'presets' | 'themes', files: [{ path, name, engine }] }
  */
 function probeDigests(opt = {}) {
   const kind = String(opt.kind || 'characters')
@@ -162,6 +257,17 @@ function probeDigests(opt = {}) {
           digest: j ? digest.worldDigest(j) : '',
           entries: j && j.entries && typeof j.entries === 'object' ? Object.keys(j.entries).length : 0
         })
+      } else if (kind === 'themes') {
+        /* 美化：指纹只算样式内容与外观字段，主题名等元信息不参与（见 digest.cjs 的 themeDigest） */
+        let j = null
+        try { j = JSON.parse(fs.readFileSync(full, 'utf8')) } catch (_) { j = null }
+        out.push({
+          path: full,
+          file: base,
+          name: String((j && j.name) || '').trim() || stem,
+          digest: j ? digest.themeDigest(j) : '',
+          kind: j && String((j && (j.customCSS || j.custom_css)) || '').trim() ? 'css' : 'ui'
+        })
       } else {
         let j = null
         try { j = JSON.parse(fs.readFileSync(full, 'utf8')) } catch (_) { j = null }
@@ -182,7 +288,7 @@ function probeDigests(opt = {}) {
 
 /** 列出酒馆里的世界书 */
 function scanWorlds(tavernPath, user) {
-  const dirs = userDirs(tavernPath, user)
+  const dirs = resolveUserDir(tavernPath, user).dirs
   if (!exists(dirs.worlds)) return { ok: false, error: '找不到世界书目录：' + dirs.worlds, dir: dirs.worlds, list: [] }
   const out = []
   for (const name of fs.readdirSync(dirs.worlds)) {
@@ -224,7 +330,7 @@ function isPromptPreset(full) {
  * opts.includeSamplerPresets = true 时连只有采样参数的引擎预设一起列出（默认屏蔽） */
 function scanPresets(tavernPath, user, opts = {}) {
   const includeSampler = !!opts.includeSamplerPresets
-  const dirs = userDirs(tavernPath, user)
+  const dirs = resolveUserDir(tavernPath, user).dirs
   const out = []
   const hidden = []
   if (!exists(dirs.root)) return { ok: false, error: '找不到酒馆用户目录：' + dirs.root, list: out }
@@ -284,7 +390,7 @@ function uiThemeFieldsOf(j) {
 
 /** 列出酒馆里的美化主题（themes/*.json，名称与样式都在 json 里） */
 function scanThemes(tavernPath, user) {
-  const dirs = userDirs(tavernPath, user)
+  const dirs = resolveUserDir(tavernPath, user).dirs
   const out = []
   if (!exists(dirs.root)) return { ok: false, error: '找不到酒馆用户目录：' + dirs.root, list: out }
   const dir = path.join(dirs.root, 'themes')
@@ -418,7 +524,7 @@ function findThemeFileByName(base, name) {
 
 function readThemeSrc(tavernPath, user, filePath, themeName) {
   const want = String(filePath || '').trim()
-  const dirs = userDirs(tavernPath, user)
+  const dirs = resolveUserDir(tavernPath, user).dirs
   const base = path.join(dirs.root, 'themes')
   let real = ''
   if (want) {
@@ -556,6 +662,23 @@ function worldBackupText(file) {
 
 /* ---------------- 导入 / 替换 ---------------- */
 
+/**
+ * 给「另起基名新建」算一个真正不撞名的基名。
+ * 用户选定独立基名后不该继续生成 (n) 副本，所以这里先看同名文件是否已被占用，
+ * 占用就派生「X 新 / X 新2 …」，直到拿到一个干净基名；名字为空时兜底 'character'。
+ */
+function independentBaseName(dirs, name) {
+  const base = safeFile(String(name || '').trim() || 'character')
+  let candidate = base
+  let i = 1
+  while (exists(path.join(dirs.characters, candidate + '.png')) || exists(path.join(dirs.chats, candidate))) {
+    candidate = `${base} 新${i === 1 ? '' : i}`
+    i++
+    if (i > 99) break
+  }
+  return candidate
+}
+
 /** 生成酒馆里不重名的 avatar 文件名（酒馆允许同名角色并存，靠文件名区分） */
 function uniqueAvatar(dirs, baseName) {
   const base = safeFile(baseName || 'character')
@@ -635,11 +758,27 @@ function chatStatsOf(dirs, avatar) {
 }
 
 /**
+ * 角色名的「同族」归一：去掉 .png、酒馆副本号 (1)、以及 2.0 / 2024 这类版本尾缀。
+ * 统一成一个函数，供「传进来的基名」和「磁盘上的文件名」共用同一套规则——
+ * 之前只有文件名侧归一，传 方亦楷2.0 去判同族就一张都匹配不上。
+ */
+function normCardName(x) {
+  return String(x || '')
+    .replace(/\.png$/i, '')
+    .replace(/\s*\(\d+\)\s*$/, '')
+    .replace(/[\s_-]*\d+(\.\d+)*$/, '')
+    .trim()
+    .toLowerCase()
+}
+
+/**
  * 找出 characters 里「同一角色的多个副本」：方亦楷.png / 方亦楷 (1).png / 方亦楷(2).png
  * 用于替换前确认，避免写错副本
  */
 function sameBaseCandidates(dirs, avatar) {
-  const base = String(avatar || '').replace(/\s*\(\d+\)\s*$/, '').trim().toLowerCase()
+  /* 基名与文件名必须走同一套归一：baseName 本身带版本尾缀（方亦楷2.0 / 方亦楷2024）时
+     也要能判出同族，否则新建会绕过三选一继续追加 (n) 副本 */
+  const base = normCardName(avatar)
   if (!base) return []
   let files = []
   try {
@@ -654,11 +793,7 @@ function sameBaseCandidates(dirs, avatar) {
     const stem = f.replace(/\.png$/i, '')
     /* (1)/(2) 是酒馆存副本的写法，2.0 / 2 这类版本号尾缀同样是在同一角色名下并存，
        两者都归一掉再比：方亦楷 (1) / 方亦楷2.0 → 方亦楷 */
-    const plain = stem
-      .replace(/\s*\(\d+\)\s*$/, '')
-      .replace(/[\s_-]*\d+(\.\d+)*$/, '')
-      .trim()
-      .toLowerCase()
+    const plain = normCardName(stem)
     /* 排序权重：同名本体 → 带 (1)/(2) 的副本 → 「名字 + 后缀」的变体
        （酒馆里常用 方亦楷哇哦 / 方亦楷哦哦 这种方式让同名角色并存，只认数字后缀就全漏掉了） */
     let rank = -1
@@ -699,6 +834,70 @@ function findCardImageByName(dirs, name) {
   return loc ? loc.buffer : null
 }
 
+/** 酒馆缩略图配置：默认跟随酒馆（avatar 96x144，可在 config.yaml 的 thumbnails.dimensions 里改） */
+function thumbConfig(tavernPath) {
+  const out = { enabled: true, width: 96, height: 144 }
+  try {
+    const p = path.join(String(tavernPath || ''), 'config.yaml')
+    if (!exists(p)) return out
+    const text = fs.readFileSync(p, 'utf8')
+    const en = text.match(/^[ \t]*thumbnails[ \t]*:[ \t]*\r?\n(?:[ \t]+.*\r?\n)*?[ \t]+enabled[ \t]*:[ \t]*(true|false)/im)
+    if (en) out.enabled = en[1].toLowerCase() === 'true'
+    const dim = text.match(/^[ \t]+avatar[ \t]*:[ \t]*\[[ \t]*(\d+)[ \t]*,[ \t]*(\d+)[ \t]*\]/im)
+    if (dim) {
+      out.width = parseInt(dim[1], 10) || 96
+      out.height = parseInt(dim[2], 10) || 144
+    }
+  } catch (_) {}
+  return out
+}
+
+/**
+ * 预热一张角色卡的缩略图缓存（酒馆侧 data/<user>/thumbnails/avatar/<avatar>）
+ * 酒馆首屏并发生成，常见几张生成失败 → 缩略图空白/串图，刷新才恢复；
+ * 这里按酒馆同样的规则先落一份缓存，让酒馆直接命中。
+ * 只补缓存，不删除、不改名酒馆任何现有文件；已有且比原图新时直接跳过。
+ * @returns {{ok:boolean, cached?:boolean, generated?:'thumb'|'copy', path?:string, error?:string, skipped?:string}}
+ */
+function warmAvatarThumbnail(tavernPath, user, avatar) {
+  const name = String(avatar || '').trim()
+  if (!name) return { ok: false, error: 'NO_AVATAR' }
+  const pre = requireTavern(tavernPath, user)
+  if (!pre.ok) return { ok: false, error: pre.error }
+  const dirs = pre.dirs
+  const src = path.join(dirs.characters, name)
+  if (!exists(src)) return { ok: false, error: 'NO_SRC' }
+  const cfg = thumbConfig(tavernPath)
+  if (!cfg.enabled) return { ok: true, skipped: 'disabled' }
+  const dst = path.join(dirs.thumbnails, name)
+  try {
+    if (exists(dst)) {
+      const so = fs.statSync(src)
+      const dc = fs.statSync(dst)
+      /* 与酒馆 generateThumbnail 的判据一致：原图比缓存新才需要重做 */
+      if (so.mtimeMs <= dc.ctimeMs) return { ok: true, cached: true, path: dst }
+    }
+    const buf = fs.readFileSync(src)
+    let out = null
+    try {
+      out = thumb.makeThumbPng(buf, cfg.width, cfg.height)
+    } catch (_) {
+      out = null
+    }
+    const generated = out ? 'thumb' : 'copy'
+    /* 解不了（16bit / 隔行 / 调色板缺失）就复制原图兜底：
+       缓存存在即可让酒馆跳过并发生成，尺寸大一点不影响列表显示 */
+    if (!out) out = buf
+    ensureDir(dirs.thumbnails)
+    const tmp = dst + '.tmp'
+    fs.writeFileSync(tmp, out)
+    fs.renameSync(tmp, dst)
+    return { ok: true, generated, path: dst, bytes: out.length }
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) }
+  }
+}
+
 /**
  * 导入到酒馆（新建一张卡，同名也新建）
  * @param {object} opt
@@ -713,7 +912,12 @@ function importCard(opt) {
   const json = opt.json || null
   const data = png.cardData(json)
   const displayName = String(opt.name || data?.name || 'character')
-  const avatar = uniqueAvatar(dirs, displayName)
+  /* 新建就是直接新建：这一步不再问用户「覆盖哪一份」。
+     同族 / 同名已存在时由 independentBaseName 另起独立基名（X → X 新 → X 新2），
+     再由 uniqueAvatar 兜底，保证既有卡一张都不碰、文件名也不会落成看不出差别的 (n) 副本。
+     想改已有卡请走 replaceCard（「更新到酒馆」）。 */
+  const baseName = independentBaseName(dirs, displayName)
+  const avatar = uniqueAvatar(dirs, baseName)
 
   let buf = opt.buffer ? Buffer.from(opt.buffer) : null
   if (!png.isPng(buf) && json) {
@@ -727,10 +931,11 @@ function importCard(opt) {
   // 世界书：新卡自带 character_book 且勾了"替换世界书"时写入 worlds
   let worldName = ''
   let writtenWorld = ''
+  let worldFilled = false
   let oldWorld = null
+  const wantWorld = String(data?.extensions?.world || '').trim()
   if (opt.replaceWorld) {
     const book = data?.character_book
-    const wantWorld = String(data?.extensions?.world || '').trim()
     if (book && Array.isArray(book.entries) && book.entries.length) {
       worldName = wantWorld || String(book.name || displayName)
       const file = path.join(dirs.worlds, safeFile(worldName) + '.json')
@@ -755,13 +960,45 @@ function importCard(opt) {
     }
   }
 
+  /* 卡里写了 extensions.world，但酒馆 worlds 下没有这个文件时，卡在酒馆里就是「世界书悬空」：
+     读得到名字、点开是空的。这里按需从资料库同名世界书补一份过去（只补缺，绝不覆盖酒馆已有世界书）。
+     opt.worldSource = { name, data } 由界面在新建前从库内同名世界书取好传下来。 */
+  if (wantWorld && !exists(path.join(dirs.worlds, safeFile(wantWorld) + '.json'))) {
+    const srcBook = opt.worldSource && opt.worldSource.data
+    if (srcBook && typeof srcBook === 'object') {
+      try {
+        ensureDir(dirs.worlds)
+        const file = path.join(dirs.worlds, safeFile(wantWorld) + '.json')
+        /* 库里的世界书可能是酒馆 world info（entries 对象），也可能是角色卡内嵌的
+           character_book（entries 数组）——后者必须先转成酒馆的格式，否则写过去读不出来 */
+        const payload = Array.isArray(srcBook.entries) ? bookToWorldInfo(srcBook, wantWorld) : srcBook
+        fs.writeFileSync(file, JSON.stringify(payload, null, 2), 'utf8')
+        worldFilled = true
+        if (!worldName) worldName = wantWorld
+      } catch (_) {}
+    }
+  }
+
   // 关键：新内容必须写进 PNG 的 chara 数据块。
   // 否则写进酒馆的是「原图自带的那份旧 JSON」——表现为文件写了、图片换了，但酒馆里角色卡内容没变。
   if (json) buf = png.writeCardJson(buf, json)
 
   const file = path.join(dirs.characters, avatar + '.png')
   fs.writeFileSync(file, buf)
-  return { ok: true, avatar, file, path: file, name: displayName, world: writtenWorld || worldName, oldWorld, mode: 'new' }
+  /* 写完立刻预热缩略图：酒馆首屏是并发生成，刚写进去的这张常生成失败 → 列表里空白或串图 */
+  const thumbResult = warmAvatarThumbnail(opt.tavernPath, pre.user || opt.user, avatar + '.png')
+  return {
+    ok: true,
+    avatar,
+    file,
+    path: file,
+    name: displayName,
+    world: writtenWorld || worldName,
+    worldFilled,
+    oldWorld,
+    thumb: thumbResult,
+    mode: 'new'
+  }
 }
 
 /**
@@ -879,7 +1116,19 @@ function replaceCard(opt) {
   if (json) buf = png.writeCardJson(buf, json)
 
   fs.writeFileSync(target, buf)
-  return { ok: true, avatar, file: target, path: target, name: String(data?.name || avatar), world: writtenWorld || worldName, oldWorld, mode: 'replace' }
+  /* 更新同样预热缩略图：原图 mtime 变新后，酒馆下次进列表才重做，这中间看到的是旧图 */
+  const thumbResult = warmAvatarThumbnail(opt.tavernPath, pre.user || opt.user, avatar + '.png')
+  return {
+    ok: true,
+    avatar,
+    file: target,
+    path: target,
+    name: String(data?.name || avatar),
+    world: writtenWorld || worldName,
+    oldWorld,
+    thumb: thumbResult,
+    mode: 'replace'
+  }
 }
 
 /** 把一份世界书写进酒馆的 worlds 目录 */
@@ -925,9 +1174,59 @@ function importWorld(opt = {}) {
   return { ok: true, name: worldName, file: target, path: target, oldWorld }
 }
 
+/* settings.json 里的 main_api（酒馆当前在用的聊天接口）与预设目录名的对应关系。
+   酒馆的预设管理器每个接口各占一个 Settings 目录，预设管理器只显示当前接口那个目录里的文件，
+   写进别的目录就等于「写成功了但酒馆里看不到」。 */
+const API_PRESET_DIRS = {
+  openai: ['OpenAI'],
+  claude: ['OpenAI'],
+  makersuite: ['OpenAI'],
+  vertexai: ['OpenAI'],
+  mistralai: ['MistralAI', 'OpenAI'],
+  cohere: ['Cohere'],
+  perplexity: ['Perplexity'],
+  groq: ['Groq'],
+  deepseek: ['DeepSeek', 'OpenAI'],
+  xai: ['xAI', 'OpenAI'],
+  ai21: ['AI21', 'OpenAI'],
+  together: ['TogetherAI', 'OpenAI'],
+  openrouter: ['OpenRouter', 'OpenAI'],
+  infermaticai: ['InfermaticAI', 'OpenAI'],
+  electronhub: ['ElectronHub', 'OpenAI'],
+  custom: ['OpenAI'],
+  google: ['Google'],
+  textgenerationwebui: ['TextGenerationWebUI', 'Ooba'],
+  ooba: ['Ooba', 'TextGenerationWebUI'],
+  tabby: ['Tabby', 'TextGenerationWebUI'],
+  ollama: ['Ollama', 'TextGenerationWebUI'],
+  llamacpp: ['llama.cpp', 'TextGenerationWebUI'],
+  vllm: ['vLLM', 'TextGenerationWebUI'],
+  kobold: ['KoboldAI'],
+  koboldhorde: ['KoboldAI Horde', 'KoboldAI'],
+  novel: ['NovelAI'],
+  scale: ['Scale'],
+  dreamgen: ['DreamGen']
+}
+
+/** 目录名/引擎名归一化：「TextGenerationWebUI Settings」与「textgenerationwebui」视为同一个 */
+function normEngine(s) {
+  return String(s || '').toLowerCase().replace(/[\s_\-]+/g, '')
+}
+
+/** 读酒馆自己记录的当前聊天接口（data/<user>/settings.json 的 main_api） */
+function readMainApi(tavernPath, user) {
+  const dirs = resolveUserDir(tavernPath, user).dirs
+  try {
+    const j = JSON.parse(fs.readFileSync(path.join(dirs.root, 'settings.json'), 'utf8'))
+    return String(j?.main_api || j?.mainApi || '').trim()
+  } catch (_) {
+    return ''
+  }
+}
+
 /** 列出酒馆里各引擎的设置目录（预设就存在这些目录里） */
 function presetDirs(tavernPath, user) {
-  const dirs = userDirs(tavernPath, user)
+  const dirs = resolveUserDir(tavernPath, user).dirs
   const out = []
   if (!exists(dirs.root)) return out
   let subs = []
@@ -951,26 +1250,73 @@ function importPreset(opt = {}) {
   if (!pre.ok) return { ok: false, error: pre.error }
   const dirs = pre.dirs
 
-  const want = String(opt.name || data.name || data.preset_name || 'untitled').trim() || 'untitled'
+  /* 落盘名统一「名字·V版本号」（例：YU·V1.4.0）：
+     前端已拼好（name 里带 ·V）时不重复追加；没给版本号就只用名字 */
+  let want = String(opt.name || data.name || data.preset_name || 'untitled').trim() || 'untitled'
+  const rawVer = String(opt.version || data.version || data.preset_version || '').trim().replace(/^v/i, '')
+  /* 只认数字版本号（1.4.0 / 2.0-beta）：「版本2」这种说明文字不拼进文件名 */
+  const okVer = /^\d+(\.\d+)*([.\-_a-z].*)?$/i.test(rawVer) ? rawVer : ''
+  if (okVer && !/[·・]V/i.test(want) && !/[\s_-]v?\d+\.\d/i.test(want)) want = want + '·V' + okVer
   const base = safeFile(want)
   const list = presetDirs(opt.tavernPath, opt.user)
+  const api = readMainApi(opt.tavernPath, opt.user)
   let engine = String(opt.engine || '').trim()
   let targetDir = ''
+  let movedFrom = ''
 
+  /* ① 上次写进哪儿（资料库记录的 stTargetPath）—— 复用，保证「更新」落到同一份文件上 */
+  let recDir = ''
   if (opt.targetPath) {
-    targetDir = path.dirname(String(opt.targetPath))
-    if (!engine) engine = path.basename(targetDir).replace(/\s*settings$/i, '')
+    const d = path.dirname(String(opt.targetPath))
+    if (exists(d)) recDir = d
   }
-  if (!targetDir) {
-    const hit = engine ? list.find((x) => x.engine.toLowerCase() === engine.toLowerCase()) : list[0]
+
+  /* ② 酒馆当前在用的接口决定它读哪个 Settings 目录。
+     以前 engine 为空时静默取 list[0]，在 Windows 上恒等于 KoboldAI Settings，
+     于是「提示成功、酒馆预设管理器里却看不到」——这里必须先按 main_api 解析。 */
+  let apiDir = ''
+  const cands = API_PRESET_DIRS[api.toLowerCase()] || []
+  for (const c of cands) {
+    const hit = list.find((x) => normEngine(x.engine) === normEngine(c))
     if (hit) {
-      targetDir = hit.dir
-      engine = hit.engine
-    } else {
-      engine = engine || 'OpenAI'
-      targetDir = path.join(dirs.root, `${engine} Settings`)
+      apiDir = hit.dir
+      break
     }
   }
+
+  if (recDir) {
+    /* 记录目录与当前接口目录一致 → 原样复用；不一致（历史错写进了别的引擎目录）→ 改写到接口目录，
+       否则「更新」会继续往酒馆看不见的地方写 */
+    if (!apiDir || path.resolve(recDir).toLowerCase() === path.resolve(apiDir).toLowerCase()) {
+      targetDir = recDir
+    } else {
+      movedFrom = recDir
+    }
+  }
+  if (!targetDir && apiDir) targetDir = apiDir
+
+  /* ③ 调用方明确点名了引擎（界面上选过） */
+  if (!targetDir && engine) {
+    const hit = list.find((x) => normEngine(x.engine) === normEngine(engine))
+    if (hit) targetDir = hit.dir
+  }
+  /* ④ 酒馆里就一个设置目录时没有歧义，直接用 */
+  if (!targetDir && list.length === 1) targetDir = list[0].dir
+
+  /* 一条都确定不了就不写：宁可报明确错误，也不能「提示成功、酒馆里没有」 */
+  if (!targetDir) {
+    const names = list.map((x) => x.engine).join(' / ') || '（一个 Settings 目录都没有找到）'
+    return {
+      ok: false,
+      error:
+        `酒馆里找不到该写进哪个预设目录：settings.json 的 main_api=${api || '未读到'}，可选目录为 ${names}。` +
+        '请先在酒馆里新建一个预设、或切换一次聊天接口让它生成对应目录，再重试'
+    }
+  }
+
+  const dirHit = list.find((x) => path.resolve(x.dir).toLowerCase() === path.resolve(targetDir).toLowerCase())
+  if (dirHit) engine = dirHit.engine
+  else if (!engine) engine = path.basename(targetDir).replace(/\s*settings$/i, '')
   ensureDir(targetDir)
 
   const overwrite = !!opt.overwrite || !!opt.replace
@@ -982,8 +1328,26 @@ function importPreset(opt = {}) {
     name = `${base} (${i})`
     target = path.join(targetDir, name + '.json')
   }
+
+  /* 覆盖旧预设前留一份原文，由前端存成备份（与角色卡 / 世界书一致的口径） */
+  let oldWorld = null
+  if (overwrite && exists(target)) {
+    try {
+      const text = fs.readFileSync(target, 'utf8')
+      let entries = 0
+      try {
+        const j = JSON.parse(text)
+        if (Array.isArray(j?.prompts)) entries = j.prompts.length
+        else entries = j?.prompt_order ? 1 : 0
+      } catch (_) {}
+      oldWorld = { name, file: target, text, entries }
+    } catch (_) {
+      oldWorld = null
+    }
+  }
+
   fs.writeFileSync(target, JSON.stringify(data, null, 2), 'utf8')
-  return { ok: true, kind: 'presets', name, engine, file: target, path: target }
+  return { ok: true, kind: 'presets', name, engine, file: target, path: target, oldWorld, movedFrom }
 }
 
 /** 内容类型未知的条目：按内容判断它该进酒馆的哪个位置 */
@@ -1067,7 +1431,6 @@ function walkFiles(dir, root, out) {
 /** 酒馆里的扩展安装状态（只读，不改动酒馆文件）
  *  latest = 安装包内置扩展源的版本号；outdated = 酒馆中版本与内置版本不一致 */
 function extStatus(tavernPath, user) {
-  const dirs = userDirs(tavernPath, user)
   const latest = readExtVersion(extSourceDir())
   const tp = String(tavernPath || '').trim()
   if (!tp) {
@@ -1078,7 +1441,10 @@ function extStatus(tavernPath, user) {
       latest,
       outdated: false,
       path: '',
-      error: '还没设置酒馆安装路径（例如 D:\\SillyTavern）'
+      user: '',
+      userCorrected: false,
+      checked: [],
+      error: '还没设置酒馆安装路径（形如 F:\\SillyTavern）'
     }
   }
   if (!exists(tp)) {
@@ -1089,15 +1455,45 @@ function extStatus(tavernPath, user) {
       latest,
       outdated: false,
       path: '',
+      user: '',
+      userCorrected: false,
+      checked: [],
       error: '找不到酒馆目录：' + tp + '，请在设置里填写正确的酒馆安装路径'
     }
   }
-  const target = path.join(dirs.extensions, 'tavernlib-sync')
-  if (!exists(path.join(target, 'manifest.json'))) {
-    return { ok: true, installed: false, version: '', latest, outdated: false, path: target }
+
+  /* 候选目录（按可能性排序）：
+     ① 解析出来的真实用户目录（stUser 无效时已回退 default-user / 实际存在的用户目录）
+     ② data 下其它真实存在的用户目录（历史数据里换过用户名的情况）
+     ③ 历史 GitHub 安装位置 public/scripts/extensions/third-party
+     ④ public/extensions
+     任一命中 manifest.json 就算已安装，并回报命中的真实路径 */
+  const rs = resolveUserDir(tp, user)
+  const checked = []
+  const pushTarget = (dir) => {
+    const t = path.join(dir, 'tavernlib-sync')
+    if (!checked.includes(t)) checked.push(t)
+  }
+  pushTarget(rs.dirs.extensions)
+  for (const c of rs.candidates) pushTarget(c.dirs.extensions)
+  for (const root of legacyExtRoots(tp)) pushTarget(root)
+
+  let target = ''
+  for (const t of checked) {
+    if (exists(path.join(t, 'manifest.json'))) {
+      target = t
+      break
+    }
+  }
+  const base = { latest, user: rs.user, userCorrected: rs.corrected, checked }
+  if (!target) {
+    return { ok: true, installed: false, version: '', outdated: false, path: checked[0] || '', ...base }
   }
   const version = readExtVersion(target)
-  return { ok: true, installed: true, version, latest, outdated: !!latest && version !== latest, path: target }
+  /* 与注入逻辑同一套版本比较：酒馆里比内置旧才算 outdated，比内置新不算 */
+  const cmp = compareVersion(version, latest)
+  const outdated = cmp === 0 ? false : cmp === null ? !!latest && version !== latest : cmp < 0
+  return { ok: true, installed: true, version, outdated, path: target, ...base }
 }
 
 /** 删掉 dir 下所有空子目录（自底向上），dir 自身保留；仅用于扩展目录内部清理 */
@@ -1120,12 +1516,76 @@ function pruneEmptyDirs(dir) {
   }
 }
 
+/** 版本号比较：返回 1(左新) / 0(相同) / -1(左旧) / null(无法比较)
+ *  支持 1.1.0 / v1.1 / 1.1.0-beta.1 这类常见写法，段数不同也能比 */
+function compareVersion(a, b) {
+  const norm = (v) =>
+    String(v == null ? '' : v)
+      .trim()
+      .replace(/^v/i, '')
+      .split(/[.+\-]/)
+      .filter((x) => x !== '')
+  const pa = norm(a)
+  const pb = norm(b)
+  if (!pa.length || !pb.length) return null
+  const len = Math.max(pa.length, pb.length)
+  for (let i = 0; i < len; i++) {
+    const sa = pa[i]
+    const sb = pb[i]
+    if (sa === undefined) return -1
+    if (sb === undefined) return 1
+    const na = /^\d+$/.test(sa) ? parseInt(sa, 10) : NaN
+    const nb = /^\d+$/.test(sb) ? parseInt(sb, 10) : NaN
+    if (!Number.isNaN(na) && !Number.isNaN(nb)) {
+      if (na > nb) return 1
+      if (na < nb) return -1
+      continue
+    }
+    // 数字段优先于预发布标记：1.1.0 > 1.1.0-beta
+    if (!Number.isNaN(na) && Number.isNaN(nb)) return 1
+    if (Number.isNaN(na) && !Number.isNaN(nb)) return -1
+    if (sa > sb) return 1
+    if (sa < sb) return -1
+  }
+  return 0
+}
+
+/** 覆盖前把目标目录整份复制到备份根（不动原目录），返回备份路径；失败返回 ''
+ *  备份放在酒馆 extensions 目录之外，避免被酒馆当成扩展加载 */
+function backupExtDir(target, backupRoot, fromVersion) {
+  if (!backupRoot) return ''
+  const d = new Date()
+  const p = (n) => String(n).padStart(2, '0')
+  const stamp =
+    '' + d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds())
+  const name = 'tavernlib-sync-v' + (fromVersion || 'unknown') + '-' + stamp
+  const dest = path.join(backupRoot, name)
+  try {
+    ensureDir(dest)
+    for (const rel of walkFiles(target)) {
+      const to = path.join(dest, rel)
+      ensureDir(path.dirname(to))
+      fs.writeFileSync(to, fs.readFileSync(path.join(target, rel)))
+    }
+    return dest
+  } catch (_) {
+    return ''
+  }
+}
+
 /** 一键注入：把扩展文件复制进 <tavernPath>/data/<user>/extensions/tavernlib-sync
- *  直接覆盖替换旧扩展（不再备份旧版本）
- *  写盘前先删除目标目录里「新包中不存在」的文件，避免旧版残留
+ *  按版本比对决定行为：
+ *    - 未安装                        -> 安装
+ *    - 已装版本低于内置版本           -> 备份旧版后覆盖升级（并清掉旧版残留文件）
+ *    - 已装版本与内置版本相同         -> 跳过，不重复覆盖（opts.force 时强制重写）
+ *    - 已装版本高于内置版本           -> 跳过，不降级（opts.force 时强制重写）
  *  只处理 tavernlib-sync 目录内部，目录本身保留，不触碰同级其它扩展
+ *  opts.backupRoot：旧版备份根目录（由主进程传入，位于酒馆目录之外）
  *  逐文件用 readFileSync + writeFileSync（打包进 asar 后 copyFileSync 不适用） */
-function injectExt(tavernPath, user) {
+function injectExt(tavernPath, user, opts) {
+  const opt = opts && typeof opts === 'object' ? opts : {}
+  const force = !!opt.force
+  const backupRoot = opt.backupRoot ? String(opt.backupRoot) : ''
   const src = extSourceDir()
   if (!exists(path.join(src, 'manifest.json'))) {
     return { ok: false, error: '安装包里找不到扩展文件：' + src }
@@ -1134,10 +1594,58 @@ function injectExt(tavernPath, user) {
   if (!req.ok) return { ok: false, error: req.error }
   const rels = walkFiles(src)
   if (!rels.length) return { ok: false, error: '安装包里的扩展文件是空的：' + src }
-  const target = path.join(req.dirs.extensions, 'tavernlib-sync')
+  /* 与状态判定同源：先在「真实用户目录 + 历史安装位置」里找已存在的 tavernlib-sync，
+     命中就更新那一份；都没有才装到解析出的用户目录。
+     以前判定看 A、注入写 B，用户会遇到「装完仍显示未安装」 */
+  const rs = resolveUserDir(tavernPath, user)
+  const cands = []
+  const addCand = (dir) => {
+    const t = path.join(dir, 'tavernlib-sync')
+    if (!cands.includes(t)) cands.push(t)
+  }
+  addCand(rs.dirs.extensions)
+  for (const c of rs.candidates) addCand(c.dirs.extensions)
+  for (const root of legacyExtRoots(tavernPath)) addCand(root)
+  const existTarget = cands.find((t) => exists(path.join(t, 'manifest.json'))) || ''
+  const target = existTarget || path.join(req.dirs.extensions, 'tavernlib-sync')
   const keep = new Set(rels.map((r) => r.split(path.sep).join('/')))
+  const builtin = readExtVersion(src)
+  const hasTarget = exists(path.join(target, 'manifest.json'))
+  const installed = hasTarget ? readExtVersion(target) : ''
+  const cmp = hasTarget ? compareVersion(installed, builtin) : null
 
+  // 版本比对：版本号读不出来（cmp 为 null）时按“需要覆盖”处理，保证能把旧目录修好
+  let mode = 'install'
+  if (hasTarget) {
+    if (cmp === 0) mode = 'same'
+    else if (cmp !== null && cmp > 0) mode = 'newer'
+    else mode = 'upgrade'
+  }
+  if ((mode === 'same' || mode === 'newer') && !force) {
+    return {
+      ok: true,
+      skipped: true,
+      changed: false,
+      mode: mode === 'same' ? 'skipped-same' : 'skipped-newer',
+      version: installed || builtin,
+      fromVersion: installed,
+      latest: builtin,
+      outdated: mode !== 'same',
+      path: target,
+      user: req.user || rs.user,
+      files: rels.map((r) => path.join(target, r)),
+      backup: '',
+      message:
+        mode === 'same'
+          ? '酒馆里已是 v' + (installed || builtin) + '，无需重复写入'
+          : '酒馆里是更新的 v' + installed + '（内置 v' + builtin + '），未降级'
+    }
+  }
+
+  let backup = ''
   try {
+    // 覆盖前先把旧目录整份备份（放在酒馆 extensions 之外，避免被当成扩展加载）
+    if (hasTarget) backup = backupExtDir(target, backupRoot, installed)
     // 增量清理：先删掉目标目录里新包不存在的文件（目录本身保留，不碰同级其它扩展）
     if (exists(target)) {
       for (const rel of walkFiles(target)) {
@@ -1156,13 +1664,26 @@ function injectExt(tavernPath, user) {
     return { ok: false, error: '写入扩展失败：' + (e && e.message ? e.message : e) }
   }
   const version = readExtVersion(target) || readExtVersion(src)
+  const forcedRewrite = force && (mode === 'same' || mode === 'newer')
   return {
     ok: true,
+    skipped: false,
+    changed: true,
+    forced: forcedRewrite,
+    mode: forcedRewrite ? 'rewrite' : hasTarget ? 'upgrade' : 'install',
     version,
-    latest: readExtVersion(src),
+    fromVersion: installed,
+    latest: builtin,
     outdated: false,
     path: target,
-    files: rels.map((r) => path.join(target, r))
+    user: req.user || rs.user,
+    files: rels.map((r) => path.join(target, r)),
+    backup,
+    message: forcedRewrite
+      ? '已强制重写 v' + version
+      : hasTarget
+        ? '已从 v' + (installed || '未知') + ' 升级到 v' + version
+        : '已安装 v' + version
   }
 }
 
@@ -1193,6 +1714,9 @@ module.exports = {
   readCardAt,
   buildCardBuffer,
   uniqueAvatar,
+  independentBaseName,
   chatStatsOf,
-  sameBaseCandidates
+  sameBaseCandidates,
+  thumbConfig,
+  warmAvatarThumbnail
 }

@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { store, showToast, importScanFiles, ignoreScanFiles, runAutoScan } from '../store.js'
 
 const files = computed(() => store.scan.files || [])
@@ -80,13 +80,117 @@ async function rescan() {
   picked.value = files.value.map((f) => f.path)
 }
 
+/* ---------------- 面板定位：贴着气泡弹出，限制在视口内，不压顶栏 ---------------- */
+const TOPBAR = 58 // 顶栏 54px + 4px 余量：面板永远不进这块区域，窗口拖动热区不会被盖住
+const PANEL_W = 384
+const MIN_H = 200
+
+const bubbleEl = ref(null)
+const panelPos = ref(null) // 自动锚定算出的 { left, top, maxH }
+const panelManual = ref(null) // 手动拖动后的 { left, top, maxH }
+let panelDrag = null
+
+function clamp(v, lo, hi) {
+  if (hi < lo) return lo
+  return Math.min(Math.max(v, lo), hi)
+}
+
+/** 以气泡当前在屏幕上的位置为锚：优先放气泡上方，空间不够放下方，再不够就压缩高度（列表内部滚动） */
+function computePanel() {
+  const el = bubbleEl.value
+  if (!el) return
+  const r = el.getBoundingClientRect()
+  const vw = window.innerWidth
+  const vh = window.innerHeight
+  const left = clamp(r.right - PANEL_W, 8, Math.max(8, vw - PANEL_W - 8))
+  const above = r.top - TOPBAR - 10
+  const below = vh - r.bottom - 10
+  let top = 0
+  let maxH = 0
+  if (above >= MIN_H || above >= below) {
+    maxH = Math.min(vh * 0.6, above)
+    top = r.top - 10 - Math.max(MIN_H, maxH)
+  } else {
+    maxH = Math.min(vh * 0.6, below)
+    top = r.bottom + 10
+  }
+  maxH = Math.max(MIN_H, Math.min(maxH, vh - TOPBAR - 16))
+  top = clamp(top, TOPBAR, Math.max(TOPBAR, vh - maxH - 8))
+  panelPos.value = { left, top, maxH }
+}
+
+function onPanelDown(e) {
+  if (e.button !== 0) return
+  if (e.target && e.target.closest && e.target.closest('button')) return // 关窗按钮只负责关窗
+  const rect = e.currentTarget.getBoundingClientRect()
+  const cur = panelManual.value || panelPos.value
+  panelDrag = {
+    dx: e.clientX - rect.left,
+    dy: e.clientY - rect.top,
+    sx: e.clientX,
+    sy: e.clientY,
+    moved: false,
+    maxH: (cur && cur.maxH) || Math.round(window.innerHeight * 0.6)
+  }
+  window.addEventListener('pointermove', onPanelMove)
+  window.addEventListener('pointerup', onPanelUp)
+}
+
+function onPanelMove(e) {
+  if (!panelDrag) return
+  if (Math.abs(e.clientX - panelDrag.sx) + Math.abs(e.clientY - panelDrag.sy) > 3) panelDrag.moved = true
+  if (!panelDrag.moved) return
+  const vw = window.innerWidth
+  const vh = window.innerHeight
+  const maxH = Math.min(panelDrag.maxH, vh - TOPBAR - 16)
+  panelManual.value = {
+    left: clamp(e.clientX - panelDrag.dx, 8, Math.max(8, vw - PANEL_W - 8)),
+    top: clamp(e.clientY - panelDrag.dy, TOPBAR, Math.max(TOPBAR, vh - maxH - 8)),
+    maxH
+  }
+}
+
+function onPanelUp() {
+  window.removeEventListener('pointermove', onPanelMove)
+  window.removeEventListener('pointerup', onPanelUp)
+  panelDrag = null
+}
+
 const panelStyle = computed(() => {
-  if (pos.value.x == null) return {}
-  const w = 384
-  const left = Math.max(8, Math.min(pos.value.x, window.innerWidth - w - 12))
-  const top = Math.max(60, pos.value.y - 30)
-  return { left: left + 'px', top: top + 'px' }
+  const p = panelManual.value || panelPos.value
+  const base = { width: PANEL_W + 'px' }
+  if (!p) return base
+  return {
+    ...base,
+    left: p.left + 'px',
+    top: p.top + 'px',
+    maxHeight: (p.maxH || Math.round(window.innerHeight * 0.6)) + 'px'
+  }
 })
+
+watch(open, async (v) => {
+  panelManual.value = null
+  if (!v) {
+    panelPos.value = null
+    return
+  }
+  await nextTick()
+  computePanel()
+})
+
+watch(
+  pos,
+  () => {
+    if (open.value) nextTick(computePanel)
+  },
+  { deep: true }
+)
+
+function onResize() {
+  if (!open.value) return
+  panelManual.value = null
+  computePanel()
+}
 
 function label(f) {
   return f.base || f.name
@@ -105,11 +209,15 @@ function dateText(f) {
 
 onMounted(() => {
   pos.value = store.scan.bubblePos?.x != null ? { ...store.scan.bubblePos } : { x: null, y: null }
+  window.addEventListener('resize', onResize)
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('pointermove', onPointerMove)
   window.removeEventListener('pointerup', onPointerUp)
+  window.removeEventListener('pointermove', onPanelMove)
+  window.removeEventListener('pointerup', onPanelUp)
+  window.removeEventListener('resize', onResize)
 })
 </script>
 
@@ -117,6 +225,7 @@ onBeforeUnmount(() => {
   <div class="scan-root">
     <!-- 气泡：常驻，右下角一直挂着，有新文件时显示数量 -->
     <div
+      ref="bubbleEl"
       class="bubble"
       :class="{ has: files.length, idle: !files.length }"
       :style="pos.x != null ? { left: pos.x + 'px', top: pos.y + 'px' } : {}"
@@ -130,9 +239,9 @@ onBeforeUnmount(() => {
       <span v-if="files.length" class="num">{{ files.length }}</span>
     </div>
 
-    <!-- 展开面板 -->
+    <!-- 展开面板：点开时贴在气泡旁边弹出，面板自身也能拖动 -->
     <div v-if="open" class="panel" :style="panelStyle" @pointerdown.stop>
-      <header>
+      <header @pointerdown="onPanelDown">
         <b v-if="files.length">发现 {{ files.length }} 个新文件</b>
         <b v-else>暂无新文件</b>
         <span class="hint">来自：{{ store.settings.scanPath || '未设置扫描目录' }}</span>
@@ -236,7 +345,12 @@ onBeforeUnmount(() => {
   gap: 9px;
   padding: 11px 13px 9px;
   border-bottom: 1px solid var(--line-soft);
+  /* 面板自身可拖动：抓住标题栏就能挪开，不再只能关掉重扫 */
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
 }
+.panel header:active { cursor: grabbing; }
 .panel header b { font-size: 13px; }
 .panel .hint {
   font-size: 10.5px;

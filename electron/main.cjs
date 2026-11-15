@@ -10,6 +10,7 @@ const bridge = require('./lib/bridge.cjs')
 const diag = require('./lib/diag.cjs')
 const dc = require('./lib/dc.cjs')
 const thumbs = require('./lib/thumbs.cjs')
+const datamove = require('./lib/datamove.cjs')
 const digestLib = require('./lib/digest.cjs')
 const tc = require('./lib/transcode.cjs') // 图片魔数 / 转码参数判定（单独成模块以便单测）
 require('./updater.cjs') // 应用内更新：下载 + 静默安装 + 自动重启（注册 up:* IPC）
@@ -245,7 +246,7 @@ app.whenReady().then(() => {
         return new Response(r.buf, {
           headers: {
             'content-type': r.mime,
-            'cache-control': 'public, max-age=31536000, immutable'
+            'cache-control': 'no-store, no-cache, must-revalidate'
           }
         })
       } catch (e) {
@@ -320,21 +321,55 @@ function safeHeaders(headers) {
 }
 
 // 通用 HTTP 代理（绕过浏览器 CORS，直连本地酒馆）
-ipcMain.handle('net:fetch', async (_e, { url, method = 'GET', headers = {}, body = null }) => {
+// redirect: 'manual' 时不跟随跳转，只把 30x 的 Location 回给渲染进程
+//   —— 更新检查靠它读 github.com/releases/latest 的 302，绕开 api.github.com 的匿名配额
+// withHeaders: true 时额外回全部响应头（HEAD 探大小要用 content-length）
+ipcMain.handle('net:fetch', async (_e, { url, method = 'GET', headers = {}, body = null, redirect = 'follow', withHeaders = false } = {}) => {
   try {
     const ck = safeHttpUrl(url)
     if (!ck.ok) return { ok: false, status: 0, error: ck.error }
-    const res = await fetch(ck.url, {
-      method,
-      headers: safeHeaders(headers),
-      body: body == null ? undefined : (typeof body === 'string' ? body : JSON.stringify(body))
-    })
-    const text = await res.text()
+    const mode = redirect === 'manual' ? 'manual' : 'follow'
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(), 20000)
+    let res = null
+    try {
+      res = await fetch(ck.url, {
+        method,
+        headers: safeHeaders(headers),
+        redirect: mode,
+        signal: ctrl.signal,
+        body: body == null ? undefined : (typeof body === 'string' ? body : JSON.stringify(body))
+      })
+    } finally {
+      clearTimeout(timer)
+    }
+    let text = ''
+    if (mode !== 'manual' || (res.status >= 200 && res.status < 300)) {
+      try { text = await res.text() } catch (_) { text = '' }
+    }
     let data = text
     try { data = JSON.parse(text) } catch (_) {}
-    return { ok: res.ok, status: res.status, data }
+    const out = {
+      ok: res.ok,
+      status: res.status,
+      data,
+      location: res.headers.get('location') || '',
+      redirected: !!res.redirected,
+      finalUrl: res.url || ''
+    }
+    if (withHeaders) {
+      const h = {}
+      try { res.headers.forEach((v, k) => { h[String(k).toLowerCase()] = String(v) }) } catch (_) {}
+      out.headers = h
+    }
+    return out
   } catch (err) {
-    return { ok: false, status: 0, error: String(err && err.message ? err.message : err) }
+    const name = String((err && err.name) || '')
+    const msg = String((err && err.message) || err)
+    /* 网络层失败时 Node 只给 "fetch failed"，真正的原因在 cause 里（ENOTFOUND / ECONNRESET 等） */
+    const cause = err && err.cause ? String(err.cause.code || err.cause.message || '') : ''
+    const text = name === 'AbortError' ? '请求超时（20 秒）' : (cause ? `${msg}（${cause}）` : msg)
+    return { ok: false, status: 0, error: text, aborted: name === 'AbortError', code: cause }
   }
 })
 
@@ -557,7 +592,15 @@ ipcMain.handle('data:saveLibrary', async (_e, text) => {
     const p = libPath()
     fs.mkdirSync(path.dirname(p), { recursive: true })
     fs.writeFileSync(p, String(text == null ? '' : text), 'utf8')
-    return { ok: true, path: p }
+    /* mtimeMs / size 回给渲染进程，用于「磁盘上的 json 有没有被外部改过」的时间戳比对 */
+    let mtimeMs = 0
+    let size = 0
+    try {
+      const st = fs.statSync(p)
+      mtimeMs = st.mtimeMs
+      size = st.size
+    } catch (_) {}
+    return { ok: true, path: p, mtimeMs, size }
   } catch (e) {
     return { ok: false, error: String((e && e.message) || e) }
   }
@@ -567,7 +610,8 @@ ipcMain.handle('data:loadLibrary', async () => {
   try {
     const p = libPath()
     if (!fs.existsSync(p)) return { ok: false, error: 'NO_SNAPSHOT' }
-    return { ok: true, text: fs.readFileSync(p, 'utf8') }
+    const st = fs.statSync(p)
+    return { ok: true, text: fs.readFileSync(p, 'utf8'), mtimeMs: st.mtimeMs, size: st.size }
   } catch (e) {
     return { ok: false, error: String((e && e.message) || e) }
   }
@@ -644,7 +688,18 @@ ipcMain.handle('data:listFiles', async (_e, { sub } = {}) => {
   }
 })
 
-/** 切换数据保存目录：写引导配置（重启生效），并把快照 / token 复制到新目录 */
+/* ---------------- 切换数据目录：整库搬迁 ----------------
+ * 搬迁本体在 lib/datamove.cjs（纯 Node、可单测）：索引 / 凭据 / 图片仓库 / 原始内容 / 缩略图
+ * 一起复制并校验。早期版本只搬 library.json 和 dc-token.bin，图片仓库留在原地 ——
+ * 换目录后库条目还在、封面全白。这里严格按「复制 → 校验 → 才写指针」执行，
+ * 中途任何一步失败都不写 datadir.json，旧目录继续可用。 */
+function sendMigrate(payload) {
+  try {
+    if (win && !win.isDestroyed()) win.webContents.send('data:migrateProgress', payload || {})
+  } catch (_) {}
+}
+
+/** 切换数据保存目录：迁移整库（索引 / 凭据 / 图片仓库 / 原始内容 / 缩略图）+ 写引导配置 */
 ipcMain.handle('data:setDir', async (_e, { dir, migrate = true } = {}) => {
   const want = String(dir || '').trim()
   let target = ''
@@ -658,42 +713,57 @@ ipcMain.handle('data:setDir', async (_e, { dir, migrate = true } = {}) => {
     if (/^[a-z]:\\(windows|program files|program files \(x86\)|programdata)(\\|$)/i.test(target)) {
       return { ok: false, error: '不能放在系统目录里，请换一个普通文件夹' }
     }
+  } else {
+    /* 恢复默认：数据也要跟着搬回默认目录，否则默认目录是空的、打开就是白板 */
+    target = path.resolve(DEFAULT_DATA_DIR)
+  }
+  try {
+    fs.mkdirSync(target, { recursive: true })
+    const probe = path.join(target, '.tavernlib-write-test')
+    fs.writeFileSync(probe, 'ok')
+    fs.unlinkSync(probe)
+  } catch (e) {
+    return { ok: false, error: '这个目录不可写：' + String((e && e.message) || e) }
+  }
+
+  const cur = path.resolve(app.getPath('userData'))
+  const bootVal = target === path.resolve(DEFAULT_DATA_DIR) ? '' : target
+  const same = target === cur
+  if (same) {
+    if (!writeBootDir(bootVal)) return { ok: false, error: '写配置失败，可能没有权限' }
+    return {
+      ok: true,
+      dir: target,
+      same: true,
+      needRestart: false,
+      migrate: { files: 0, bytes: 0, skipped: 0, backedUp: '', dirs: [] }
+    }
+  }
+
+  const info = { files: 0, bytes: 0, skipped: 0, backedUp: '', dirs: [] }
+  if (migrate) {
+    /* 复制前先停掉缩略图编码窗口：避免它继续往旧目录写 webp、也避免文件句柄占用 */
     try {
-      fs.mkdirSync(target, { recursive: true })
-      const probe = path.join(target, '.tavernlib-write-test')
-      fs.writeFileSync(probe, 'ok')
-      fs.unlinkSync(probe)
-    } catch (e) {
-      return { ok: false, error: '这个目录不可写：' + String((e && e.message) || e) }
-    }
+      thumbs.shutdownEncoder()
+    } catch (_) {}
+    /* 整库搬迁：索引 / 凭据 / 图片仓库 / 原始内容 / 缩略图，复制 + 校验都在 datamove 里，
+       校验不通过它直接返回 ok:false，下面就不会写 datadir.json */
+    const mv = await datamove.migrateDataDir(cur, target, {
+      files: [LIB_FILE, 'dc-token.bin'],
+      onProgress: (ev) => sendMigrate(ev)
+    })
+    if (!mv.ok) return { ok: false, error: mv.error || '搬迁失败' }
+    info.files = mv.files
+    info.bytes = mv.bytes
+    info.skipped = mv.skipped
+    info.backedUp = mv.backedUp
+    info.dirs = mv.dirs
   }
 
-  const cur = app.getPath('userData')
-  const same = !!target && path.resolve(target) === path.resolve(cur)
-  if (!writeBootDir(target === path.resolve(DEFAULT_DATA_DIR) ? '' : target)) {
-    return { ok: false, error: '写配置失败，可能没有权限' }
-  }
-
-  const copied = []
-  if (migrate && target && !same) {
-    for (const f of [LIB_FILE, 'dc-token.bin']) {
-      try {
-        const src = path.join(cur, f)
-        if (fs.existsSync(src)) {
-          fs.copyFileSync(src, path.join(target, f))
-          copied.push(f)
-        }
-      } catch (_) {}
-    }
-  }
-
-  return {
-    ok: true,
-    dir: target || DEFAULT_DATA_DIR,
-    same,
-    needRestart: !same,
-    copied
-  }
+  /* 只有全部复制并校验通过，才写引导配置改指针 */
+  if (!writeBootDir(bootVal)) return { ok: false, error: '写配置失败，可能没有权限' }
+  sendMigrate({ phase: 'done', done: 1, total: 1 })
+  return { ok: true, dir: target, same: false, needRestart: true, migrate: info }
 })
 
 /* ================= 文件系统辅助（供导入 / 导出 / 扫描使用） ================= */
@@ -850,8 +920,15 @@ ipcMain.handle('st:themeSrc', async (_e, { tavernPath, user, file, name } = {}) 
 /** 酒馆里配套扩展的安装状态（只读） */
 ipcMain.handle('st:extStatus', async (_e, { tavernPath, user } = {}) => stLib.extStatus(tavernPath, user))
 
-/** 把随软件打包的扩展一键注入酒馆 extensions 目录 */
-ipcMain.handle('st:extInject', async (_e, { tavernPath, user } = {}) => stLib.injectExt(tavernPath, user))
+/** 把随软件打包的扩展一键注入酒馆 extensions 目录
+ *  按版本比对：缺失 -> 安装；旧版 -> 备份后升级；同版本 -> 跳过（force=true 时强制重写）
+ *  旧版备份放在软件数据目录下，不落在酒馆 extensions 里，避免被酒馆当成扩展加载 */
+ipcMain.handle('st:extInject', async (_e, { tavernPath, user, force } = {}) =>
+  stLib.injectExt(tavernPath, user, {
+    force: !!force,
+    backupRoot: path.join(app.getPath('userData'), 'ext-backups')
+  })
+)
 
 /** 下载一个链接（DC 图片直链等）到临时目录，返回本地路径
  *  注意：Discord 的 ?format=webp 会把 PNG 重新编码，角色卡内嵌的 chara 元数据会丢，
@@ -954,7 +1031,9 @@ ipcMain.handle('net:download', async (_e, { url } = {}) => {
   }
 })
 
-/** 导入到酒馆（新建，同名也新建） */
+/** 新建到酒馆：直接新建一份，不问覆盖。
+ *  同族 / 同名已存在时由 stLib.importCard → independentBaseName 自动另起独立基名（X → X 新 → X 新2），
+ *  既有卡一张都不动。更新已有卡请走 st:replaceCard。 */
 ipcMain.handle('st:importCard', async (_e, opt = {}) => {
   try {
     const r = stLib.importCard(opt)
@@ -1043,7 +1122,9 @@ ipcMain.handle('st:importWorld', async (_e, opt = {}) => {
 ipcMain.handle('st:importPreset', async (_e, opt = {}) => {
   try {
     const r = stLib.importPreset(opt)
-    if (r.ok) bridge.notify({ action: 'reload', preset: r.name })
+    /* engine 是实际落盘的 Settings 目录名（OpenAI / TextGenerationWebUI…），
+       酒馆端扩展据此重载对应引擎的预设列表，才能把新预设直接塞进下拉 */
+    if (r.ok) bridge.notify({ action: 'reload', preset: r.name, engine: r.engine || '' })
     return r
   } catch (e) {
     return { ok: false, error: String(e.message || e) }
@@ -1094,7 +1175,7 @@ ipcMain.handle('st:importFromSidecar', async (_e, opt = {}) => {
     else if (category === 'others' || kind === 'any') r = stLib.importAny(payload)
     else r = stLib.importWorld(payload)
     if (r && r.ok) {
-      if (category === 'presets' || kind === 'preset') bridge.notify({ action: 'reload', preset: r.name })
+      if (category === 'presets' || kind === 'preset') bridge.notify({ action: 'reload', preset: r.name, engine: r.engine || '' })
       else bridge.notify({ action: 'reload', world: r.name, name: r.name })
     }
     return r

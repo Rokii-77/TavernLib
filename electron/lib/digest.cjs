@@ -87,12 +87,57 @@ function presetDigest(raw) {
   return hashStr(canon(raw))
 }
 
+/**
+ * 酒馆「UI 主题」里真正影响外观的字段。
+ * 改动时必须与 electron/lib/st.cjs 的 UI_THEME_KEYS 保持一致，
+ * 否则酒馆侧与资料库侧摘出来的字段不同、指纹永远对不上。
+ */
+const THEME_UI_KEYS = [
+  'main_text_color', 'italics_text_color', 'underline_text_color', 'quote_text_color',
+  'blur_tint_color', 'chat_tint_color', 'user_mes_blur_tint_color', 'bot_mes_blur_tint_color',
+  'shadow_color', 'border_color', 'blur_strength', 'shadow_width', 'font_scale', 'chat_width',
+  'avatar_style', 'chat_display', 'noShadows', 'fast_ui_mode', 'waifuMode', 'reduced_motion',
+  'compact_input_area', 'hideChatAvatars_enabled', 'expand_message_actions', 'media_display',
+  'click_to_edit', 'timestamps_enabled', 'mesIDDisplay_enabled', 'message_token_count_enabled'
+]
+
+function themeFieldsOf(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const out = {}
+  for (const k of THEME_UI_KEYS) if (k in raw) out[k] = raw[k]
+  return Object.keys(out).length ? out : null
+}
+
+/**
+ * 美化（themes/*.json）指纹：只认样式内容与外观字段。
+ * 主题名、导入时间、作者这些元信息在两边写法不同（资料库记的是条目名），
+ * 参与指纹会让「同一份美化」永远对不上，所以一律不纳入。
+ */
+function themeDigest(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return ''
+  const css = String(raw.customCSS || raw.custom_css || raw.css || '').replace(/\r\n?/g, '\n').trim()
+  const fields = themeFieldsOf(raw) || {}
+  if (!css && !Object.keys(fields).length) return ''
+  return hashStr(canon({ css, fields }))
+}
+
 /** 按分类算版本指纹 */
 function digestOf(category, raw) {
   if (!raw) return ''
   if (category === 'worldbooks') return worldDigest(raw)
   if (category === 'presets') return presetDigest(raw)
+  if (category === 'themes') return themeDigest(raw)
   return charDigest(raw)
 }
 
-module.exports = { hashStr, canon, cardPayloadOf, charDigest, worldDigest, presetDigest, digestOf }
+module.exports = {
+  hashStr,
+  canon,
+  cardPayloadOf,
+  charDigest,
+  worldDigest,
+  presetDigest,
+  themeDigest,
+  themeFieldsOf,
+  digestOf
+}

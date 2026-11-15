@@ -1,8 +1,8 @@
 {
   "name": "tavern-lib",
-  "version": "1.0.0",
+  "version": "1.0.6",
   "private": true,
-  "description": "洛书匣 · 酒馆角色卡/世界书/预设/美化主题的本地资料库管理器",
+  "description": "酒馆角色卡/世界书/预设管理器",
   "author": "Roki",
   "main": "electron/main.cjs",
   "type": "module",
@@ -12,11 +12,14 @@
     "app": "electron .",
     "start": "electron .",
     "preview": "vite preview --port 4180",
+    "test": "node tests/importer.test.mjs && node tests/backup.test.mjs && node tests/backup-roundtrip.test.mjs && node tests/update-flow.test.mjs && node tests/releases.test.mjs && node tests/rollback.test.cjs && node tests/rollback-flow.test.mjs && node tests/topbar-layout.test.mjs && node tests/transcode.test.mjs && node tests/itemcat.test.mjs && node tests/p6-backup-entry.test.mjs && node tests/bridge-state.test.cjs && node tests/tavern-batch.test.mjs && node tests/library-authority.test.mjs && node tests/greeting-view.test.mjs",
     "pack:dir": "vite build && electron-builder --dir",
     "dist": "vite build && electron-builder --win"
   },
   "dependencies": {
+    "dompurify": "^3.4.18",
     "jszip": "^3.10.2",
+    "marked": "^18.2.0",
     "vue": "^3.5.13"
   },
   "devDependencies": {
@@ -38,7 +41,6 @@
     ],
     "win": {
       "icon": "build/icon.ico",
-      "executableName": "TavernLib",
       "target": [
         {
           "target": "nsis",
@@ -50,8 +52,7 @@
     },
     "nsis": {
       "oneClick": false,
-      "allowToChangeInstallationDirectory": true,
-      "artifactName": "TavernLib-Setup-${version}.exe"
+      "allowToChangeInstallationDirectory": true
     }
   }
 }

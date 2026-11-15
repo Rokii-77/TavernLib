@@ -71,7 +71,8 @@ async function injectExt() {
   try {
     const r = await a.stExtInject({ tavernPath: store.settings.tavernPath, user: store.settings.stUser })
     if (!r || !r.ok) showToast((r && r.error) || '注入失败')
-    else showToast('已写入扩展 v' + (r.version || ext.value.latest || '') + '，去酒馆刷新一下界面')
+    else if (r.skipped) showToast(r.message || '酒馆里已是 v' + (r.version || ext.value.latest || '') + '，未重写')
+    else showToast((r.message || '已写入扩展 v' + (r.version || ext.value.latest || '')) + '，去酒馆刷新一下界面')
   } catch (e) {
     showToast('注入异常：' + (e && e.message ? e.message : e))
   } finally {

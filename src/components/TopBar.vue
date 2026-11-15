@@ -1,6 +1,17 @@
 <script setup>
 import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
-import { store, tabs, openMenu, runUpdateCheck, showToast, openImportWith, clearSearch, toggleTheme, setTheme } from '../store.js'
+import {
+  store,
+  tabs,
+  updateCounts,
+  openMenu,
+  runUpdateCheck,
+  showToast,
+  openImportWith,
+  clearSearch,
+  toggleTheme,
+  setTheme
+} from '../store.js'
 import { resolveTheme } from '../lib/theme.js'
 
 /* ---------- 自绘窗口按钮（主进程已 frame:false，原生标题栏不存在） ---------- */
@@ -147,11 +158,16 @@ function checkMenu(e) {
         v-for="t in tabs"
         :key="t.key"
         class="tab"
-        :class="{ active: store.tab === t.key }"
+        :class="{ active: store.tab === t.key, upd: updateCounts[t.key] > 0 }"
+        :title="updateCounts[t.key] > 0 ? `${t.label}：${updateCounts[t.key]} 个条目有新版本` : undefined"
         @click="switchTab(t.key)"
       >
         {{ t.label }}
         <em>{{ (store.items[t.key] || []).length }}</em>
+        <!-- 更新角标：检查更新后直接标在分类上，不用切过去才知道这一类有变化 -->
+        <span v-if="updateCounts[t.key] > 0" class="upd-badge">
+          {{ updateCounts[t.key] > 99 ? '99+' : updateCounts[t.key] }}
+        </span>
       </button>
     </nav>
 
@@ -336,6 +352,23 @@ function checkMenu(e) {
   font-weight: 600;
 }
 .tab.active em { color: rgba(32, 24, 10, 0.65); background: rgba(0, 0, 0, 0.1); }
+/* 有更新的分类：文字提亮 + 数字角标；未切过去也能一眼看到哪一类有新版本 */
+.tab.upd { color: var(--text); }
+.tab.upd em { color: var(--accent); }
+.upd-badge {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 16px; height: 16px; padding: 0 4px;
+  border-radius: 999px;
+  font-size: 10.5px; font-weight: 700; line-height: 1;
+  color: #20180a;
+  background: linear-gradient(180deg, var(--accent-2), var(--accent));
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.18), 0 2px 6px rgba(212, 162, 76, 0.32);
+}
+.tab.active .upd-badge {
+  color: var(--accent-2);
+  background: #20180a;
+  box-shadow: none;
+}
 
 .right {
   margin-left: auto; display: flex; align-items: center; gap: 7px;

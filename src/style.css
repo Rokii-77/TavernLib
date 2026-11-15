@@ -30,6 +30,22 @@
   --scroll-thumb-hover: #454e5b;
   --body-glow-1: rgba(212, 162, 76, 0.07);
   --body-glow-2: rgba(93, 132, 214, 0.06);
+
+  /* 详情页左侧栏（封面 + 备注 + 资料）：夜间是一层压深的玻璃，
+     日间必须换成浅色玻璃，否则会剩下一整块死灰色，和白色主区割裂 */
+  --side-bg: linear-gradient(180deg, rgba(22, 26, 32, 0.55), rgba(15, 17, 20, 0.28));
+  --side-cover-border: rgba(255, 255, 255, 0.07);
+  --side-cover-glow: inset 0 0 60px rgba(0, 0, 0, 0.35);
+  --side-initial: rgba(255, 255, 255, 0.26);
+  --side-note-bg: rgba(255, 255, 255, 0.03);
+  --side-note-line: rgba(255, 255, 255, 0.12);
+  --side-note-line-hover: rgba(255, 255, 255, 0.24);
+  --side-note-edit-bg: rgba(0, 0, 0, 0.25);
+  --overlay-3: rgba(255, 255, 255, 0.08);
+  /* 无封面时占位渐变的明度（hsl 亮度）与收尾色，随主题切换 */
+  --cover-l1: 34%;
+  --cover-l2: 16%;
+  --cover-ink: #12151a;
 }
 
 /* 日间主题：只换变量，结构 / 布局 / 交互一律不动 */
@@ -62,6 +78,20 @@
   --scroll-thumb-hover: #a9b1bd;
   --body-glow-1: rgba(212, 162, 76, 0.10);
   --body-glow-2: rgba(93, 132, 214, 0.08);
+
+  /* 日间左侧栏：比主区白再浅一档的冷灰玻璃，靠分隔线收边，不再是深灰块 */
+  --side-bg: linear-gradient(180deg, #f8f9fc, #eef1f6);
+  --side-cover-border: rgba(24, 30, 40, 0.10);
+  --side-cover-glow: inset 0 0 44px rgba(23, 28, 38, 0.07);
+  --side-initial: rgba(28, 33, 42, 0.22);
+  --side-note-bg: rgba(24, 30, 40, 0.035);
+  --side-note-line: rgba(24, 30, 40, 0.14);
+  --side-note-line-hover: rgba(24, 30, 40, 0.28);
+  --side-note-edit-bg: #ffffff;
+  --overlay-3: rgba(20, 24, 32, 0.10);
+  --cover-l1: 60%;
+  --cover-l2: 42%;
+  --cover-ink: #eaeef4;
 }
 
 * { box-sizing: border-box; }

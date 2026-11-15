@@ -691,10 +691,8 @@ function cardMenu(e, it) {
       { divider: true }
     )
   }
-  menu.push(
-    { label: '打开详情', action: () => openItem(it.id) },
-    { label: '重命名', action: () => doRename(it) }
-  )
+  /* 「打开详情」不再放右键：双击卡片就能打开，右键只留不与双击重复的动作 */
+  menu.push({ label: '重命名', action: () => doRename(it) })
   // 预设专属：单条可编辑标签；多选可批量加标签
   if (catKey === 'presets') {
     menu.push({ label: '编辑标签', hint: '空格或逗号分隔', action: () => doEditTags(it) })
@@ -865,22 +863,10 @@ function cardMenu(e, it) {
     </div>
 
     <transition name="bar">
-      <div v-if="batchCount" class="selbar" @mousedown.stop>
-        <span class="num">
-          <svg
-            v-if="batchCount === 1"
-            class="num-tick"
-            width="11"
-            height="11"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="3.4"
-          >
-            <path d="m4 12.5 5.5 5.5L20 7" />
-          </svg>
-          已选 {{ batchCount }} 项
-        </span>
+      <!-- 只在多选时出现：单选时下面的条与右键菜单完全重叠（检查更新/导入/导出/移除都能右键做），
+           多选时这些才是右键做不到的批量专有动作，因此保留。 -->
+      <div v-if="batchCount > 1" class="selbar" @mousedown.stop>
+        <span class="num">已选 {{ batchCount }} 项</span>
         <div class="ops">
           <button v-if="isPresetTab" @click="doBatchAddTags(selectedItems)">加标签</button>
           <button @click="batchCheck">检查更新</button>

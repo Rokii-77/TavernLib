@@ -77,7 +77,7 @@ const steps = [
   {
     sel: '[data-guide="detail-version-ops"]',
     title: '更新与新建',
-    text: '「更新到酒馆」用日期最新那版直接写进酒馆；版本行右键「新建到酒馆」，把某一版另存成一份新的。',
+    text: '「更新到酒馆」用日期最新那版直接写进酒馆；版本行右键「新建到酒馆」，把某一版另存成一份新的——酒馆里已有同名卡时自动另起基名（如「X 新」），不会覆盖任何已有卡。',
     before: () => {
       store.tab = 'characters'
       store.currentId = TOUR_DEMO_IDS.char

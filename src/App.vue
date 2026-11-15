@@ -1,4 +1,4 @@
-<script setup>
+﻿<script setup>
 import { computed, onMounted, onUnmounted } from 'vue'
 import TopBar from './components/TopBar.vue'
 import Bookshelf from './views/Bookshelf.vue'
@@ -17,7 +17,9 @@ import OnboardTour from './components/OnboardTour.vue'
 import {
   store, currentItem, closeMenu, selectAllVisible, clearSelect,
   checkStConnection, hydrateFromDataFile, ensureCoverImages, wbFolderById,
-  startStWatch, stopStWatch, pokeStStatus, normalizeAllTags, checkAppUpdateOnStart, checkStExtVersion,
+  startStWatch, stopStWatch, pokeStStatus, normalizeAllTags, migrateModelTags, checkAppUpdateOnStart,
+  syncLibraryNow, startLibrarySync, stopLibrarySync,
+  autoCheckDcUpdatesOnStart, autoCheckStExtOnStart,
   shouldShowFirstRun, finishFirstRun, endOnboardTour, showToast
 } from './store.js'
 
@@ -45,13 +47,27 @@ onMounted(async () => {
   })
 
   /* 酒馆开/关、切到别的窗口再回来，状态都要自己跟上，不用重启资料库 */
-  const onFocus = () => { pokeStStatus() }
+  const onFocus = () => {
+    pokeStStatus()
+    /* 权威源是数据目录里的 library.json：窗口回到前台就重新比一次时间戳，
+       外部（手工清理 / 备份还原）改过的库立刻生效 */
+    Promise.resolve(syncLibraryNow()).catch(() => {})
+  }
   window.addEventListener('focus', onFocus)
+  const onVisible = () => {
+    if (document.visibilityState === 'visible') {
+      pokeStStatus()
+      Promise.resolve(syncLibraryNow()).catch(() => {})
+    }
+  }
+  document.addEventListener('visibilitychange', onVisible)
   startStWatch()
 
   // 换了软件数据目录后，靠数据目录里的 library.json 把库接回来
   const _tHydrate = performance.now()
   await hydrateFromDataFile()
+  /* 启动恢复完成后开始轮询 library.json：外部改写不用重启软件就能生效 */
+  startLibrarySync()
   if (window.__bootT) window.__bootT.hydrate = performance.now() - _tHydrate
 
   /* 首屏已经出来了，再做重量级的收尾工作（都放到空闲时间，不挡渲染）*/
@@ -71,6 +87,13 @@ onMounted(async () => {
     } catch (e) {
       console.warn('[tag normalize] failed', e)
     }
+    /* 归一之后再统一模型标签：族名 gemini → 与徽标一致的 gemini 4，
+       消除同一预设「gemini + gemini 4」并存，并让完整名进入筛选池 */
+    try {
+      migrateModelTags()
+    } catch (e) {
+      console.warn('[model tag migrate] failed', e)
+    }
   }
   if (typeof requestIdleCallback === 'function') requestIdleCallback(normTags, { timeout: 2500 })
   else setTimeout(normTags, 800)
@@ -83,6 +106,14 @@ onMounted(async () => {
   if (typeof requestIdleCallback === 'function') requestIdleCallback(updCheck, { timeout: 6000 })
   else setTimeout(updCheck, 3000)
 
+  /* DC 更新：每次启动自动检查一次（和右上角「检查更新」同一套逻辑）。
+     延后 5 秒、界面已经能用了才开始；静默执行、不弹窗、不自动下载，
+     有更新只靠顶栏角标提示；没登录/token、没网、没填链接都不打扰启动。
+     这条链路只打 Discord 接口，和上面的 GitHub Releases 版本检查互不相干。 */
+  setTimeout(() => {
+    Promise.resolve(autoCheckDcUpdatesOnStart()).catch(() => {})
+  }, 5000)
+
   /* 酒馆连接状态：先立刻查一次给状态条，之后交给 startStWatch 定时自检
      （酒馆中途开了/关了，状态会自己变；窗口最小化时暂停）。
      启动阶段不自动扫描目录 —— 那是「打开软件就卡」的主要来源，
@@ -90,20 +121,24 @@ onMounted(async () => {
   if (store.settings.tavernPath) {
     /* 不 await：一次 IPC + HTTP 探测不该挡住首屏 */
     Promise.resolve(checkStConnection(true)).catch(() => {})
-    /* 扩展版本对不上时，右下角弹一次提示（只提示，不自动安装） */
-    setTimeout(checkExtOnStart, 1800)
+    /* 扩展版本自动比对：延后 8 秒，避开上面 GitHub 版本检查（空闲时最晚 6 秒）
+       和 DC 更新检查（5 秒），三条链路各跑各的、互不干扰。
+       只读一次 extStatus 做比对：内置版本比酒馆里的新才点亮右下角提示卡，
+       没装扩展 / 没配路径 / 读取出错一律静默；只提示不自动注入。 */
+    setTimeout(checkExtOnStart, 8000)
   }
 })
 
-/* ---------- C3：酒馆扩展版本校验（更新完第一次打开也走这里） ----------
+/* ---------- C3：酒馆扩展版本校验（每次启动自动比对一次） ----------
  * 比对「软件内置扩展版本」与「酒馆目录里那份扩展的版本」，
- * 不一致就在右下角弹提示让用户重新注入；只提示，不自动改酒馆文件。 */
+ * 内置比酒馆里的新就在右下角提示可升级（卡片里的按钮走既有注入入口）；
+ * 只读比对、只提示，不自动覆盖注入、不弹窗打断、不写酒馆文件。 */
 let extChecked = false
 async function checkExtOnStart() {
   if (extChecked) return
   extChecked = true
   try {
-    await checkStExtVersion()
+    await autoCheckStExtOnStart()
   } catch (e) {
     console.warn('[ext check] failed', e)
   }
@@ -111,6 +146,7 @@ async function checkExtOnStart() {
 
 onUnmounted(() => {
   stopStWatch()
+  stopLibrarySync()
 })
 
 /* ---------- 封面 dataURL 迁移（启动卡顿的主要来源） ----------

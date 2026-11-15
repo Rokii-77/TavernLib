@@ -1,4 +1,4 @@
-import { reactive, computed, watch, markRaw } from 'vue'
+﻿import { reactive, computed, watch, markRaw } from 'vue'
 import {
   IMG, urlOf, ensureImage, ensureImages, hashText,
   saveImageDataUrl, saveImageBytes, isDataUrl, b64Payload,
@@ -9,9 +9,12 @@ import { digestOf } from './lib/digest.js'
 import { parsePresetName, presetGroupKey, detectModel } from './lib/preset.js'
 import { applyTheme, applyCustomCss, resolveTheme, onSystemThemeChange } from './lib/theme.js'
 import { checkForUpdate, listReleases, DEFAULT_UPDATE_SOURCE } from './lib/update.js'
+import { judgeExtVersion } from './lib/extver.js'
 import { CAT_ORDER, catIndex } from './lib/itemcat.js'
 
 const SETTINGS_KEY = 'tavern-lib-settings'
+/* 设置的备份键：主键被写坏 / 解析失败时还能把用户填的路径救回来 */
+const SETTINGS_BAK_KEY = 'tavern-lib-settings-bak'
 const ITEMS_KEY = 'tavern-lib-items'
 
 /** 之前内置的示例数据：既按名称剔除，也按短 id（mock 用 c1/w1/p1/o1 这种短号，真实条目是长号）剔除 */
@@ -116,30 +119,74 @@ export function catOf(item) {
 /** 内部沿用旧名 */
 const resolveCat = catOf
 
-function loadItems() {
+function countItemsOf(items) {
+  let n = 0
+  for (const k of CAT_KEYS) n += Array.isArray(items?.[k]) ? items[k].length : 0
+  return n
+}
+
+/** 本机本地时间戳（带时区偏移），写进 library.json 的 savedLocalAt，人工查库时一眼看出写入时刻 */
+function localStamp(d = new Date()) {
+  const p = (n) => String(n).padStart(2, '0')
+  const off = -d.getTimezoneOffset()
+  const sign = off >= 0 ? '+' : '-'
+  const abs = Math.abs(off)
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T` +
+    `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${String(d.getMilliseconds()).padStart(3, '0')}` +
+    `${sign}${p(Math.floor(abs / 60))}:${p(abs % 60)}`
+}
+
+/* ---------------- localStorage：降级成「时间戳缓存」 ----------------
+ * 权威源只有一份：数据目录里的 library.json。
+ * localStorage 里现在只留 {"savedAt":..,"localAt":..,"v":2}，记录本机最后一次保存时
+ * json 的 savedAt，用来判断「磁盘上的 json 有没有比我手里的新」。
+ *
+ * 历史坑（本次要根治的）：旧版把整库写进 localStorage，启动时只要 localStorage 有值就
+ * 不读 json —— 真正的权威源其实是缓存。手工清理 json 里的 224 条遗留备份版本后，
+ * 第二天一启动就被 localStorage 里的旧整库回写覆盖。 */
+function readItemsCache() {
+  let raw = ''
+  try { raw = String(localStorage.getItem(ITEMS_KEY) || '') } catch (_) { return null }
+  if (!raw) return null
+  let o = null
+  try { o = JSON.parse(raw) } catch (_) { return null }
+  if (!o || typeof o !== 'object') return null
+  /* 老格式：整库（含 characters/... 数组）；新格式：只有时间戳 */
+  const legacy = CAT_KEYS.some((k) => Array.isArray(o[k]))
+  if (legacy) return { legacy: o, savedAt: '', localAt: '', raw }
+  return { legacy: null, savedAt: String(o.savedAt || ''), localAt: String(o.localAt || ''), raw }
+}
+
+function writeItemsStamp(stamp) {
   try {
-    const raw = localStorage.getItem(ITEMS_KEY)
-    const data = raw ? JSON.parse(raw) : null
-    const items = data && typeof data === 'object' ? data : emptyItems()
-    for (const k of ['characters', 'worldbooks', 'presets', 'themes', 'others']) {
-      if (!Array.isArray(items[k])) items[k] = []
-    }
-    if (stripMock(items)) {
-      try { localStorage.setItem(ITEMS_KEY, JSON.stringify(items)) } catch (_) {}
-    }
-    markRawPayloads(items)
-    /* 老库的 localStorage 快照里还塞着 versions[].raw（实测曾到 60MB）：
-       每次启动都要整串读出来 + JSON.parse 一遍，光这一步就够卡好几秒。
-       这里在启动后空闲时把快照重写成瘦身版（raw 落侧车），下次启动直接快。 */
-    if (raw && raw.length > 2 * 1024 * 1024) {
-      setTimeout(() => {
-        try { saveItems() } catch (_) {}
-      }, 4000)
-    }
-    return tagCategories(items)
-  } catch (_) {
-    return emptyItems()
-  }
+    localStorage.setItem(ITEMS_KEY, JSON.stringify({
+      savedAt: String(stamp?.savedAt || ''),
+      localAt: String(stamp?.localAt || localStamp()),
+      v: 2
+    }))
+  } catch (_) {}
+}
+
+/** 老版本整包缓存 → 规范化的 items；没有 / 空的返回 null（只在 json 缺失或损坏时用） */
+function legacyCachedItems() {
+  const c = readItemsCache()
+  if (!c || !c.legacy) return null
+  const items = emptyItems()
+  for (const k of CAT_KEYS) items[k] = Array.isArray(c.legacy[k]) ? c.legacy[k] : []
+  if (!countItemsOf(items)) return null
+  stripMock(items)
+  markRawPayloads(items)
+  return ensureCurrentVersion(tagCategories(items))
+}
+
+function loadItems() {
+  /* 启动时内存的起点：只可能是「旧版 localStorage 整包缓存」。
+     新版 localStorage 只剩时间戳，条目一律等 hydrateFromDataFile() 从 library.json 重建。 */
+  try {
+    const legacy = legacyCachedItems()
+    if (legacy) return legacy
+  } catch (_) {}
+  return emptyItems()
 }
 
 /* ---------------- 侧车文件：raw / 备份内容不再塞进快照 ----------------
@@ -221,6 +268,9 @@ export function slimItems() {
   return out
 }
 
+/** 正在读的侧车文件：同一文件的并发请求共用一次读盘（详情页开场白预载与正则预载几乎同时发起） */
+const rawPending = new Map()
+
 /** 按需把某个版本的原始 JSON 读回来（推酒馆 / 导出 / 看内容时用） */
 export async function ensureVersionRaw(item, version) {
   if (!version) return undefined
@@ -231,13 +281,32 @@ export async function ensureVersionRaw(item, version) {
     version.raw = markRaw(rawCache.get(fn))
     return version.raw
   }
-  const a = apiOf()
-  if (!a?.dataReadFile) return undefined
-  const r = await a.dataReadFile({ sub: RAW_SUB, name: fn })
-  if (!r || !r.ok || !r.text) return undefined
-  let data = null
-  try { data = JSON.parse(r.text) } catch (_) { return undefined }
-  rawCache.set(fn, data)
+  let p = rawPending.get(fn)
+  if (!p) {
+    const a = apiOf()
+    if (!a?.dataReadFile) return undefined
+    p = (async () => {
+      const r = await a.dataReadFile({ sub: RAW_SUB, name: fn })
+      if (!r || !r.ok || !r.text) return null
+      try {
+        return JSON.parse(r.text)
+      } catch (_) {
+        return null
+      }
+    })()
+      .then((data) => {
+        rawPending.delete(fn)
+        if (data) rawCache.set(fn, data)
+        return data
+      })
+      .catch(() => {
+        rawPending.delete(fn)
+        return null
+      })
+    rawPending.set(fn, p)
+  }
+  const data = await p
+  if (!data) return undefined
   version.raw = markRaw(data)
   return version.raw
 }
@@ -258,7 +327,7 @@ export function themeCssOf(ver, item) {
 /** 异步版：版本 raw 可能还在侧车文件里，读回来再取 CSS */
 export async function loadThemeCss(item, version) {
   if (!item) return ''
-  const ver = version || (item.versions || []).find((v) => v.current) || (item.versions || [])[0] || null
+  const ver = version || bestVersionOf(item) || null
   let css = themeCssOf(ver, item)
   if (!css && ver && ver.rawFile) {
     try {
@@ -302,7 +371,7 @@ export function themeJsonOf(ver, item) {
 /** 详情页预览用：一次性拿到 CSS 源 + 外观字段 */
 export async function loadThemeDoc(item, version) {
   if (!item) return { css: '', theme: null }
-  const ver = version || (item.versions || []).find((v) => v.current) || (item.versions || [])[0] || null
+  const ver = version || bestVersionOf(item) || null
   let css = themeCssOf(ver, item)
   let theme = themeFieldsOf(ver, item)
   if ((!css || !theme) && ver && ver.rawFile) {
@@ -382,21 +451,43 @@ export async function ensureBackupText(rec) {
 
 let saveTimer = null
 
-/** 立即整库落盘（切数据目录、清库等关键路径用） */
+/* ---------------- 路径类设置保护 ----------------
+ * 「首次打开路径被重置」的另一个入口：某个时序把 store.settings 换成了默认值，
+ * 随后的 saveItems / saveSettings 会把空路径一起写进 library.json 与 localStorage，
+ * 磁盘上原本有效的酒馆路径、扫描路径就此被覆盖。
+ * 这里记住每个路径键最后一次的非空值，写盘前用它兜住空值。 */
+const PATH_SETTING_KEYS = [
+  'tavernPath', 'scanPath', 'backupLastDir', 'tavernUrl', 'stUser',
+  'previewAvatarUser', 'previewAvatarChar', 'previewBg'
+]
+let lastGoodSettings = {}
+function guardPathSettings(obj) {
+  if (!obj || typeof obj !== 'object') return obj
+  for (const k of PATH_SETTING_KEYS) {
+    const cur = obj[k]
+    const empty = cur === undefined || cur === null || String(cur).trim() === ''
+    if (empty) {
+      if (lastGoodSettings[k]) obj[k] = lastGoodSettings[k]
+    } else {
+      lastGoodSettings[k] = cur
+    }
+  }
+  return obj
+}
+
+/** 立即整库落盘（切数据目录、清库等关键路径用）—— 只写 library.json，不再写 localStorage 正文 */
 export function saveItems() {
   if (saveTimer) {
     clearTimeout(saveTimer)
     saveTimer = null
   }
-  let json = ''
-  try {
-    /* 只把「瘦身副本」写进 localStorage：versions[].raw / backups 正文已落侧车。
-       以前这里写的是 store.items 原样，含 33MB 的 raw，每次保存都要整串序列化 +
-       写进 leveldb，启动再整串读回来解析 —— 这就是书架越来越卡的直接原因。 */
-    json = JSON.stringify(slimItems())
-    localStorage.setItem(ITEMS_KEY, json)
-  } catch (_) {}
-  persistSnapshot(json)
+  /* 写盘前先把内存里被清空的路径类设置补回来：
+     整库写入会带着 settings 一起落盘，这里不挡一道，空路径就会顺着 library.json 传下去 */
+  guardPathSettings(store.settings)
+  /* 启动保护：json 还没读进内存（bootHydrated=false）而内存是空的，这一笔绝不能落盘 ——
+     localStorage 降级成时间戳后，内存起步就是空库，此时写一次就会把磁盘上好好的库清空。 */
+  if (!bootHydrated && countItemsOf(store.items) === 0) return
+  persistSnapshot('')
 }
 
 /**
@@ -443,7 +534,22 @@ export function toPlain(v, depth = 0) {
 const apiOf = () => (typeof window !== 'undefined' ? window.api : null)
 let snapTimer = null
 
-function snapshotText(itemsJson) {
+/* ---------------- 权威源状态 ----------------
+ * bootHydrated：内存里的库是否已经从 library.json 恢复过（恢复前禁止把空内存写盘）
+ * dirtySinceSave：内存有还没落盘的改动（轮询时先写盘，别被磁盘上的旧内容盖掉）
+ * knownStamp：上一次读/写到的 json 的戳（savedAt + 主进程给的 mtime / size）
+ * lastSnapshotSig：我们自己最后写下去那份文本的签名，读回来一致就是自己写的，不用再拉 */
+let bootHydrated = false
+let dirtySinceSave = false
+let knownStamp = { savedAt: '', mtimeMs: 0, size: 0 }
+let lastSnapshotSig = ''
+/* 内存「换代」计数：每次按外部 json 整体覆盖内存就 +1。
+   覆盖前排队等着落盘的防抖任务拿着旧代号，fire 时发现代号变了就直接放弃，
+   否则它会把覆盖前的旧内容晚一步写回磁盘（外部清理白做）。 */
+let snapshotEpoch = 0
+
+/** 生成 library.json 的正文：savedAt（UTC ISO）+ savedLocalAt（本机本地戳）一起写 */
+function snapshotPayload(itemsJson) {
   let items = itemsJson
   if (!items) {
     try {
@@ -454,72 +560,269 @@ function snapshotText(itemsJson) {
   }
   let settings = '{}'
   try {
+    /* 写快照前同样过路径保护：library.json 是换数据目录后唯一的救命数据，
+       不能让一次内存里的空值把路径写没 */
+    guardPathSettings(store.settings)
     settings = JSON.stringify(store.settings)
   } catch (_) {}
-  return `{"items":${items || '{}'},"settings":${settings},"savedAt":"${new Date().toISOString()}"}`
+  const now = new Date()
+  /* savedAt：UTC ISO，跨机跨时区拿来比对「谁更新」；savedLocalAt：本地时间，打开 json 一眼看到写入时刻 */
+  const savedAt = now.toISOString()
+  const savedLocalAt = localStamp(now)
+  const text = `{"items":${items || '{}'},"settings":${settings},"savedAt":"${savedAt}","savedLocalAt":"${savedLocalAt}"}`
+  return { text, savedAt, savedLocalAt }
 }
 
-function persistSnapshot(itemsJson) {
+/* 文本指纹直接用 lib/image.js 的 hashText（与侧车内容签名同一套），只用来判
+   「读回来的这份是不是我自己刚写下去的」，不做安全用途 */
+function sigOfText(text) {
+  const s = String(text || '')
+  try { return String(s.length) + ':' + hashText(s) } catch (_) { return String(s.length) }
+}
+
+/** 写成功后对齐「已知戳」，并把 savedAt 记进 localStorage 的缓存戳 */
+function markStampWritten(payload, res) {
+  knownStamp = {
+    savedAt: String(payload?.savedAt || ''),
+    mtimeMs: Number(res?.mtimeMs || 0),
+    size: Number(res?.size || (payload?.text || '').length)
+  }
+  lastSnapshotSig = sigOfText(payload?.text)
+  writeItemsStamp({ savedAt: knownStamp.savedAt, localAt: payload?.savedLocalAt })
+  dirtySinceSave = false
+}
+
+function persistSnapshot(itemsJson, opt = {}) {
   const a = apiOf()
   if (!a?.saveLibrary) return
-  if (snapTimer) clearTimeout(snapTimer)
-  snapTimer = setTimeout(() => {
-    try {
-      a.saveLibrary(snapshotText(itemsJson))
-    } catch (_) {}
-  }, 600)
+  if (snapTimer) { clearTimeout(snapTimer); snapTimer = null }
+  const epoch = snapshotEpoch
+  const fire = () => {
+    snapTimer = null
+    /* 内存已经被外部 json 整体换过：这一笔是旧内容，写下去等于撤销外部修改 */
+    if (epoch !== snapshotEpoch) return
+    let payload = null
+    try { payload = snapshotPayload(itemsJson) } catch (_) { return }
+    let p = null
+    try { p = a.saveLibrary(payload.text) } catch (_) { dirtySinceSave = true; return }
+    const done = (res) => {
+      if (res && res.ok === false) { dirtySinceSave = true; lastSnapshotSig = ''; return }
+      markStampWritten(payload, res)
+    }
+    if (p && typeof p.then === 'function') p.then(done).catch(() => { dirtySinceSave = true })
+    else done({ ok: true })
+  }
+  if (opt.immediate) fire()
+  else snapTimer = setTimeout(fire, 600)
 }
 
 /** 立即落盘（切换数据目录前调用，保证新目录拿到的是最新数据） */
 export async function flushSnapshot() {
   const a = apiOf()
   if (!a?.saveLibrary) return false
-  clearTimeout(snapTimer)
-  const r = await a.saveLibrary(snapshotText())
-  return !!(r && r.ok)
+  if (snapTimer) { clearTimeout(snapTimer); snapTimer = null }
+  let payload = null
+  try { payload = snapshotPayload('') } catch (_) { return false }
+  let r = null
+  try { r = await a.saveLibrary(payload.text) } catch (_) { return false }
+  if (!r || r.ok === false) return false
+  markStampWritten(payload, r)
+  return true
+}
+
+function hasItemId(id) {
+  if (!id) return false
+  for (const k of CAT_KEYS) {
+    for (const it of store.items[k] || []) {
+      if (it && String(it.id) === String(id)) return true
+    }
+  }
+  return false
 }
 
 /**
- * 启动时补数据：localStorage 里一条都没有，而数据目录里有 library.json 快照
- * （典型场景：刚把数据目录换到别的盘），就把快照恢复回内存与 localStorage。
+ * 用 json 里的条目「整体覆盖」内存（不做按 id 并集合并）。
+ * 并集合并会把外部（手工清理 / 备份还原）已经删掉的条目从内存里再反填回去，
+ * 这正是旧逻辑「删了又复活」的根子 —— 所以这里只做替换。
  */
-export async function hydrateFromDataFile() {
-  const a = apiOf()
-  if (!a?.loadLibrary) return false
-  const total = ['characters', 'worldbooks', 'presets', 'themes', 'others'].reduce(
-    (n, k) => n + ((store.items[k] || []).length),
-    0
-  )
-  if (total) return false
-  if (String(localStorage.getItem(ITEMS_KEY) || '').trim()) return false
-  const r = await a.loadLibrary()
-  if (!r || !r.ok || !r.text) return false
-  let snap = null
-  try {
-    snap = JSON.parse(r.text)
-  } catch (_) {
-    return false
-  }
-  if (!snap || typeof snap !== 'object') return false
-  const items = snap.items
-  const count = items && typeof items === 'object'
-    ? ['characters', 'worldbooks', 'presets', 'themes', 'others'].reduce((n, k) => n + (Array.isArray(items[k]) ? items[k].length : 0), 0)
-    : 0
-  if (!count) return false
+function applySnapshotItems(items) {
   const restored = emptyItems()
-  for (const k of ['characters', 'worldbooks', 'presets', 'themes', 'others']) {
-    restored[k] = Array.isArray(items[k]) ? items[k] : []
-  }
+  for (const k of CAT_KEYS) restored[k] = Array.isArray(items?.[k]) ? items[k] : []
   markRawPayloads(restored)
-  store.items = tagCategories(restored)
-  if (snap.settings && typeof snap.settings === 'object') {
-    store.settings = { ...store.settings, ...snap.settings }
+  ensureCurrentVersion(restored)
+  const tagged = tagCategories(restored)
+  const count = countItemsOf(tagged)
+  const wasWatching = !!itemsWatcher
+  /* 覆盖期间摘掉深 watch：否则整库赋值会触发一次「把刚拉到的东西再写回去」的无用落盘 */
+  if (wasWatching) suspendItemsSave()
+  store.items = tagged
+  /* 外部删掉的条目若正被选中 / 正在详情页里，引用一并清掉，别留一个点不掉的空白详情 */
+  if (store.currentId && !hasItemId(store.currentId)) store.currentId = null
+  if (Array.isArray(store.selected) && store.selected.length) {
+    store.selected = store.selected.filter((id) => hasItemId(id))
+    if (!store.selected.length) store.selectMode = false
   }
-  try {
-    localStorage.setItem(ITEMS_KEY, JSON.stringify(slimItems()))
-  } catch (_) {}
-  showToast(`已从数据目录恢复 ${count} 个条目`)
-  return true
+  if (wasWatching) startItemsWatch()
+  /* 换代：把覆盖前排队未落盘的改动作废（包括 400ms 的 scheduleSave 与 600ms 的快照防抖） */
+  snapshotEpoch += 1
+  if (saveTimer) {
+    clearTimeout(saveTimer)
+    saveTimer = null
+  }
+  if (snapTimer) {
+    clearTimeout(snapTimer)
+    snapTimer = null
+  }
+  dirtySinceSave = false
+  return count
+}
+
+/** 磁盘上的 json 是否比「我们上次读/写的那个版本」更新 */
+function stampIsNewer(next) {
+  if (!knownStamp.savedAt && !knownStamp.mtimeMs && !knownStamp.size) return true
+  if (next.savedAt && knownStamp.savedAt && next.savedAt !== knownStamp.savedAt) return true
+  if (next.mtimeMs && knownStamp.mtimeMs && next.mtimeMs !== knownStamp.mtimeMs) return true
+  if (next.size && knownStamp.size && next.size !== knownStamp.size) return true
+  return false
+}
+
+/** 从数据目录读 library.json（唯一真相），按需整体覆盖内存 */
+async function pullFromDataFile(opt = {}) {
+  const a = apiOf()
+  if (!a?.loadLibrary) return { ok: false, reason: 'no-api', changed: false }
+  let r = null
+  try { r = await a.loadLibrary() } catch (_) { r = null }
+  if (!r || !r.ok || !r.text) return { ok: false, reason: 'no-snapshot', changed: false }
+  const text = String(r.text)
+  let snap = null
+  try { snap = JSON.parse(text) } catch (_) { return { ok: false, reason: 'bad-json', changed: false } }
+  if (!snap || typeof snap !== 'object' || !snap.items || typeof snap.items !== 'object') {
+    return { ok: false, reason: 'bad-json', changed: false }
+  }
+  const next = {
+    savedAt: String(snap.savedAt || ''),
+    mtimeMs: Number(r.mtimeMs || 0),
+    size: Number(r.size || text.length)
+  }
+
+  /* ① 内容就是我们自己刚写下去那份：只对齐戳，不重建内存（免得打断正在编辑的状态） */
+  if (!opt.force && lastSnapshotSig && sigOfText(text) === lastSnapshotSig) {
+    knownStamp = next
+    writeItemsStamp({ savedAt: next.savedAt })
+    return { ok: true, changed: false, reason: 'self-write' }
+  }
+  /* ② 时间戳没动 = 外部没改过，不白拉一遍 */
+  if (!opt.force && !stampIsNewer(next)) {
+    fillSettingsFromSnapshot(snap.settings)
+    return { ok: true, changed: false, reason: 'unchanged' }
+  }
+
+  const before = countItemsOf(store.items)
+  const count = applySnapshotItems(snap.items)
+  knownStamp = next
+  writeItemsStamp({ savedAt: next.savedAt })
+  fillSettingsFromSnapshot(snap.settings)
+  const changed = opt.force ? count !== before : true
+  if (opt.notify && changed) showToast(`已按 library.json 同步 ${count} 个条目`)
+  else if (opt.bootToast && before === 0 && count > 0) showToast(`已从数据目录恢复 ${count} 个条目`)
+  return { ok: true, changed, reason: 'pulled', count, before }
+}
+
+/**
+ * 启动恢复：以数据目录的 library.json 为唯一真相重建内存。
+ * 只要 json 存在且可解析就用它整体重建（不再判 localStorage 是否为空 ——
+ * 以前那个判断让旧缓存成了事实上的权威源）。
+ * json 缺失或损坏时才回落 localStorage（旧版整包缓存），并立即补写 json。
+ */
+export async function hydrateFromDataFile(opt = {}) {
+  const a = apiOf()
+  if (!a?.loadLibrary) { bootHydrated = true; return false }
+  const res = await pullFromDataFile({
+    force: opt.force !== false,
+    notify: !!opt.notify,
+    bootToast: opt.toast !== false
+  })
+  if (res.ok) {
+    bootHydrated = true
+    return !!res.changed
+  }
+  /* 走到这里：json 不存在 / 解析失败。回落 localStorage 的旧整包缓存（loadItems 已读进内存的
+     那份，或这里再取一次），然后立刻把内存补写回 json，避免下次启动还是无源可读。 */
+  bootHydrated = true
+  let total = countItemsOf(store.items)
+  if (!total) {
+    const legacy = legacyCachedItems()
+    if (legacy) total = applySnapshotItems(legacy)
+  }
+  if (total > 0) {
+    const wrote = await flushSnapshot()
+    if (wrote) showToast(`数据文件缺失，已按本机缓存重建 ${total} 个条目`)
+  }
+  return false
+}
+
+/**
+ * 运行期同步（窗口聚焦 / 可见性变化 / 定时轮询调它）：
+ * 外部对 library.json 的改动（手工清理、备份还原、另一处的写入）在这里生效。
+ */
+export async function syncFromDataFile(opt = {}) {
+  if (!bootHydrated) return await hydrateFromDataFile(opt)
+  /* 本地还有没落盘的改动：先把手里的写下去，不能被磁盘上的旧内容盖掉 */
+  if (dirtySinceSave) { saveItems(); return false }
+  const res = await pullFromDataFile({ force: false, notify: opt.notify !== false })
+  return !!res.changed
+}
+
+/** 立刻同步一次（聚焦 / 可见性变化用） */
+export async function syncLibraryNow() {
+  return syncFromDataFile({ notify: true })
+}
+
+let libSyncTimer = null
+
+/** 定时轮询 library.json（窗口隐藏时跳过，不白白读盘） */
+export function startLibrarySync(intervalMs = 10000) {
+  stopLibrarySync()
+  const ms = Math.max(3000, Number(intervalMs) || 10000)
+  libSyncTimer = setInterval(() => {
+    try {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
+    } catch (_) {}
+    Promise.resolve(syncFromDataFile({ notify: true })).catch(() => {})
+  }, ms)
+  return libSyncTimer
+}
+
+export function stopLibrarySync() {
+  if (libSyncTimer) {
+    clearInterval(libSyncTimer)
+    libSyncTimer = null
+  }
+}
+
+/**
+ * 把快照里的设置补回内存：只补当前为空 / 缺失的键，用户刚改过的值不动。
+ * @returns {boolean} 是否有键被补回
+ */
+function fillSettingsFromSnapshot(snapSettings) {
+  if (!snapSettings || typeof snapSettings !== 'object') return false
+  let n = 0
+  for (const k of Object.keys(snapSettings)) {
+    const v = snapSettings[k]
+    if (v === undefined || v === null) continue
+    if (typeof v === 'string' && !v.trim()) continue
+    const cur = store.settings[k]
+    const empty = cur === undefined || cur === null || (typeof cur === 'string' && !cur.trim())
+    if (empty) {
+      store.settings[k] = v
+      n++
+    }
+  }
+  if (n) {
+    guardPathSettings(store.settings)
+    saveSettings()
+  }
+  return n > 0
 }
 
 /** 清空资料库所有条目（设置保留）。用于清除早期示例 / 测试数据 */
@@ -568,9 +871,26 @@ function loadSettings() {
     // 首次使用初始化指引是否已看过：false / 缺省时启动自动弹一次
     onboarded: false
   }
+  /* 读设置：主键解析失败时退回备份键，最后才用默认值补缺。
+     以前 JSON 一坏就整份 return def —— 用户填好的酒馆路径 / 扫描路径会被默认值
+     一次性冲掉，这是「首次打开设置被重置」的直接原因之一。 */
+  let s = { ...def }
   try {
-    const raw = localStorage.getItem(SETTINGS_KEY)
-    const s = raw ? { ...def, ...JSON.parse(raw) } : def
+    let obj = null
+    for (const key of [SETTINGS_KEY, SETTINGS_BAK_KEY]) {
+      const raw = localStorage.getItem(key)
+      if (!raw) continue
+      try {
+        const parsed = JSON.parse(raw)
+        if (parsed && typeof parsed === 'object') {
+          obj = parsed
+          break
+        }
+      } catch (_) {
+        /* 这份坏了，试下一份 */
+      }
+    }
+    s = obj ? { ...def, ...obj } : { ...def }
     /* 更新源写死在代码里（设置页不让手填）：历史数据里残留的任何值一律纠正，
        否则回退会拿着脏 owner/repo 去请求，接口 404 被误判成「仓库或 Release 不存在」 */
     s.updateOwner = DEFAULT_UPDATE_SOURCE.owner
@@ -585,15 +905,25 @@ function loadSettings() {
     // 外观：主题非法值回落跟随系统；自定义 CSS 必须是字符串
     if (!['dark', 'light', 'auto'].includes(s.theme)) s.theme = 'auto'
     if (typeof s.customCss !== 'string') s.customCss = ''
+    /* 把这次读到的有效路径记成保护基线：后面任何一次写盘遇到空值都能拿它兜住 */
+    for (const k of PATH_SETTING_KEYS) {
+      if (s[k] !== undefined && s[k] !== null && String(s[k]).trim() !== '') lastGoodSettings[k] = s[k]
+    }
     return s
   } catch (_) {
-    return def
+    /* 归一过程中出错也只丢出错的字段，不再把整份设置打成默认值 */
+    return s
   }
 }
 
 export function saveSettings() {
+  /* 写盘前先过一遍路径保护：内存里若被清空，不要让它覆盖磁盘上的有效路径 */
+  guardPathSettings(store.settings)
+  const text = JSON.stringify(store.settings)
   try {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(store.settings))
+    localStorage.setItem(SETTINGS_KEY, text)
+    /* 同写一份备份：主键被写坏时还能把设置救回来 */
+    localStorage.setItem(SETTINGS_BAK_KEY, text)
   } catch (_) {}
   // 快照里同时含 settings，合并到下一次整库写入，避免改个排序就整库序列化一次
   scheduleSave(500)
@@ -744,14 +1074,24 @@ export const store = reactive({
     downloadName: '',
     downloadDigest: '',
     downloadSize: 0,
-    ignored: false
+    ignored: false,
+    /* 检查链路信息：走的哪条通道、怎么校验、失败了属于哪种错 */
+    channel: '',
+    channelLabel: '',
+    verify: '',
+    verifyLabel: '',
+    manifest: false,
+    manifestNote: '',
+    kind: '',
+    error: '',
+    hint: ''
   },
 
   /** 更新包下载/安装进度：右下角弹窗与设置面板共用同一份状态 */
   upd: { phase: 'idle', mode: '', percent: 0, received: 0, total: 0, error: '', pkg: '', sha256: '', toVersion: '' },
 
   /** 酒馆里的扩展版本与软件内置不一致时的提醒（右下角弹窗，提示重新注入） */
-  extRemind: { visible: false, installed: true, builtin: '', tavern: '', path: '', busy: false },
+  extRemind: { visible: false, installed: true, builtin: '', tavern: '', path: '', busy: false, state: '' },
 
   /** 更新看门狗：新版装完没正常启动时，提示回退到上一版 */
   rollback: { suspect: false, from: '', to: '', attempts: 0, target: '', busy: false, hint: '' }
@@ -766,7 +1106,11 @@ function startItemsWatch() {
   if (itemsWatcher) return
   itemsWatcher = watch(
     () => store.items,
-    () => scheduleSave(),
+    () => {
+      /* 内存已领先磁盘：轮询/聚焦时先写盘，别被磁盘上的旧内容盖掉 */
+      dirtySinceSave = true
+      scheduleSave()
+    },
     { deep: true }
   )
 }
@@ -805,6 +1149,22 @@ export const allItems = computed(() => tabs.flatMap((t) => store.items[t.key] ||
 function hasUpdateFlag(it) {
   return it && it.dc && it.dc.hasUpdate === true ? 1 : 0
 }
+
+/**
+ * 各分类「有多少条检查出了更新」。
+ * 顶栏分类页签据此挂角标：检查完更新后不用一条条切过去才知道哪一类有变化。
+ * all 键是总数，供顶栏按钮/提示复用。
+ */
+export const updateCounts = computed(() => {
+  const out = { all: 0 }
+  for (const t of tabs) {
+    let n = 0
+    for (const it of store.items[t.key] || []) n += hasUpdateFlag(it)
+    out[t.key] = n
+    out.all += n
+  }
+  return out
+})
 
 function sortList(list) {
   // 大类排序：日期升序 / 降序 / 名称（拼音）；有更新的条目永远排在最前
@@ -1290,6 +1650,180 @@ function versionMatches(v, sig, key) {
   return false
 }
 
+/* ---------------- 版本正文完整度 / 辅助指纹 ----------------
+ * 背景：备份包里的 json 可能只是精简元数据（没有 first_mes），
+ * 这类「残缺卡」算出来的 keyOfPayload 与库里的完整卡必然不同，
+ * 于是绕过全部去重无条件新增成「第 2 版」——197 组重复就是这么来的。
+ * 下面三个工具用来兜住这种情况：完整度打分、辅助指纹、同基名同日期的槽位判定。
+ */
+
+/** 版本正文完整度打分：开场白 / 描述 / 人设 / 场景 / 备选开场白越多分越高 */
+export function payloadRichness(payload) {
+  if (!payload || typeof payload !== 'object') return 0
+  const d = cardDataOf(payload) || payload
+  if (!d || typeof d !== 'object') return 0
+  let n = 0
+  for (const k of ['name', 'description', 'personality', 'scenario', 'first_mes', 'mes_example', 'system_prompt', 'creator_notes']) {
+    const v = d[k]
+    if (typeof v !== 'string' || !v.trim()) continue
+    n += v.trim().length >= 20 ? 2 : 1
+  }
+  const alt = Array.isArray(d.alternate_greetings) ? d.alternate_greetings.filter((x) => String(x || '').trim()).length : 0
+  n += Math.min(alt, 5)
+  return n
+}
+
+/**
+ * 按类别给「正文完整度」打分。
+ * payloadRichness 只认角色卡字段，世界书 / 美化 / 预设全被判成 0 分，
+ * 于是「精简元数据 json」与「完整正文」同分，覆盖方向随机 —— 世界书 44 条条目被一张
+ * 178 字节的空壳覆盖就是这么发生的。这里按类别各自算分，才能真正比出谁更完整。
+ */
+export function contentScoreOf(category, payload) {
+  if (!payload || typeof payload !== 'object') return 0
+  /* 老数据 / 测试数据可能没写 category：按 payload 形态反推类别，
+     否则一律落进「其他」分支按 JSON 长度算分，角色卡空壳与完整卡分不出高下 */
+  if (!category) {
+    const d = cardDataOf(payload) || payload
+    if (payload.spec || (d && (d.first_mes !== undefined || d.alternate_greetings !== undefined || d.personality !== undefined))) {
+      category = 'characters'
+    } else if (payload.entries || (payload.data && payload.data.entries)) {
+      category = 'worldbooks'
+    } else if (typeof payload.css === 'string' || typeof payload.customCSS === 'string' || typeof payload.custom_css === 'string') {
+      category = 'themes'
+    }
+  }
+  if (category === 'characters') return payloadRichness(payload)
+  if (category === 'worldbooks') {
+    const e = payload.entries || (payload.data && payload.data.entries)
+    const n = e ? (Array.isArray(e) ? e.length : Object.keys(e).length) : 0
+    return n * 4 + (String(payload.name || payload.bookName || '').trim() ? 1 : 0)
+  }
+  if (category === 'themes') {
+    const css = String(payload.css ?? payload.customCSS ?? payload.custom_css ?? '').trim()
+    const th = payload.theme && typeof payload.theme === 'object' ? Object.keys(payload.theme).length : 0
+    return (css ? 4 + Math.min(Math.floor(css.length / 2000), 10) : 0) + (th ? 2 : 0)
+  }
+  if (category === 'presets') {
+    let n = 0
+    const body = payload.data && typeof payload.data === 'object' ? payload.data : payload
+    for (const k of ['prompts', 'prompt_order', 'temperature', 'top_p', 'max_tokens', 'openai_max_tokens']) {
+      const v = body[k] !== undefined ? body[k] : payload[k]
+      if (Array.isArray(v) ? v.length : v !== undefined && v !== null && v !== '') n++
+    }
+    if (Array.isArray(body.prompts)) n += Math.min(Math.floor(body.prompts.length / 4), 6)
+    return n
+  }
+  try {
+    return Math.min(Math.floor(canonJson(payload).length / 400), 40)
+  } catch (_) {
+    return 0
+  }
+}
+
+/** 正文是否为空壳（按类别判定）：角色卡看开场白/描述，其余看各自类别的完整度分 */
+export function hasBodyOf(category, payload) {
+  if (!payload || typeof payload !== 'object') return false
+  if (category === 'characters') return hasCardBody(payload)
+  /* 只剩 name / data 这类元信息时，各分类得分都 <= 1 */
+  return contentScoreOf(category, payload) > 1
+}
+
+/** 正文是否为空壳：既没开场白也没描述（精简元数据 json 的典型形态） */
+function hasCardBody(payload) {
+  if (!payload || typeof payload !== 'object') return false
+  const d = cardDataOf(payload) || payload
+  if (!d || typeof d !== 'object') return false
+  return !!(String(d.first_mes || '').trim() || String(d.description || '').trim())
+}
+
+/**
+ * 辅助指纹：名称 + 版本名 + 日期。
+ * 与 keyOfPayload（正文指纹）配合使用：正文指纹对「残缺卡 vs 完整卡」天然失效，
+ * 辅助指纹不看正文，因此能认出「同一条目的同一个版本」，避免重复新增。
+ */
+export function auxKeyOfPayload(category, payload, extra = {}) {
+  const d = category === 'characters' ? cardDataOf(payload) || {} : payload || {}
+  const name = String(extra.name || (d && d.name) || '').trim().toLowerCase()
+  const ver = String(extra.version || (d && (d.character_version || d.version)) || '').trim().toLowerCase()
+  const day = String(extra.day || '').trim()
+  if (!name && !ver) return ''
+  return hashText(canonJson({ n: name, v: ver, d: day }))
+}
+
+/** 版本名基名：去掉「第 N 版」后缀，用于「同基名」判定 */
+function verBaseName(n) {
+  return String(n || '').replace(/\s*第\s*\d+\s*版\s*$/, '').trim().toLowerCase()
+}
+
+/**
+ * 是否是同一个版本槽位。
+ *  ① 辅助指纹（名称 + 版本名 + 日期）命中 → 同一个版本；
+ *  ② 版本名完全相同 → 同一个版本（老库没有 aux，靠这条认）。
+ * 刻意不再用「去掉『第 N 版』后同基名 + 同日期」这种松判定：
+ * 备份包里 `2026-09-22`（44 条条目）与 `2026-09-22 第2版`（空壳）是两个真实版本，
+ * 松判定会把后者并进前者，再用空壳覆盖正文 —— 版本数变少、世界书条目清零都是它干的。
+ */
+function sameVersionSlot(v, baseName, day, aux) {
+  if (!v) return false
+  if (aux && v.aux && v.aux === aux) return true
+  const a = String(v.name || '').trim()
+  const b = String(baseName || '').trim()
+  return !!a && a === b
+}
+
+/**
+ * 条目的「最完整版本」：当前版本有正文就用当前，否则取正文最全的那个。
+ * 取代旧的「无条件 versions[0]」兜底 —— 空壳版抢占当前版本会让详情页读到空开场白。
+ */
+export function bestVersionOf(item) {
+  const list = item && Array.isArray(item.versions) ? item.versions : []
+  if (!list.length) return null
+  const cat = (item && item.category) || ''
+  const cur = list.find((v) => v.current) || null
+  let best = list[0]
+  let bestScore = contentScoreOf(cat, best.raw)
+  for (const v of list) {
+    const s = contentScoreOf(cat, v.raw)
+    if (s > bestScore) {
+      best = v
+      bestScore = s
+    }
+  }
+  if (cur && (hasBodyOf(cat, cur.raw) || !hasBodyOf(cat, best.raw))) return cur
+  return best
+}
+
+/**
+ * 修正条目的当前版本标记。
+ * 两种异常都会修：
+ *  1) 一个 current 都没有 → 补一个，且补的是正文最全的版本（而不是旧逻辑里的 versions[0]）；
+ *  2) current 指向空壳版（既没开场白也没描述）、而同一版本槽位/其它版本里有正文 → 切到最完整的那个。
+ *    老库里「备份精简版抢占当前版本」正是这么来的，不修就会一直读到空开场白。
+ * 用户主动选过、且本身有正文的当前版本一律不动。
+ */
+export function ensureCurrentVersion(items) {
+  const cats = items && typeof items === 'object' ? CAT_ORDER : []
+  for (const k of cats) {
+    for (const it of Array.isArray(items[k]) ? items[k] : []) {
+      const list = it && Array.isArray(it.versions) ? it.versions : []
+      if (!list.length) continue
+      const best = bestVersionOf(it) || list[0]
+      if (!best) continue
+      const cat = it.category || k
+      const cur = list.find((v) => v.current) || null
+      const needFix = !cur || (cur !== best && !hasBodyOf(cat, cur.raw) && hasBodyOf(cat, best.raw))
+      if (!needFix) continue
+      try {
+        for (const v of list) v.current = v === best
+        it.stVersion = best.name || it.stVersion
+        if (best.imgId) it.imgId = best.imgId
+      } catch (_) {}
+    }
+  }
+  return items
+}
+
 /** 从导入行里取图片，落进图片仓库，返回内容哈希（同内容只存一份） */
 async function imageIdOfRow(r) {
   if (!r) return ''
@@ -1303,6 +1837,43 @@ async function imageIdOfRow(r) {
 }
 
 /**
+ * 用新导入的行补全一个「已经存在」的版本。
+ * 铁律：只有在「新内容更完整」时才覆盖正文，绝不拿残缺卡把完整卡冲掉。
+ * @returns {boolean} 是否真的补全了内容
+ */
+function fillVersionPayload(v, r, cat, sig, key, aux) {
+  if (!v || !r) return false
+  let changed = false
+  let incoming = null
+  try {
+    incoming = r.payload && typeof r.payload === 'object' ? toPlain(r.payload) : null
+  } catch (_) {
+    incoming = null
+  }
+  if (incoming) {
+    /* 按类别比完整度：角色卡看卡字段，世界书看条目数，美化看 CSS，预设看参数/提示词。
+       旧版只算角色卡分，世界书 / 美化永远同分，且 `!hasCardBody` 一命中就无条件覆盖，
+       于是备份包里 178 字节的空壳把 44 条条目的世界书冲掉了。 */
+    const oldScore = contentScoreOf(cat, v.raw)
+    const newScore = contentScoreOf(cat, incoming)
+    const oldBody = hasBodyOf(cat, v.raw)
+    const newBody = hasBodyOf(cat, incoming)
+    /* 只有在「新内容有正文」且「老内容没正文，或新内容明显更完整」时才覆盖 —— 绝不降级 */
+    if (newBody && (!oldBody || newScore > oldScore)) {
+      try { v.raw = markRaw(incoming) } catch (_) { v.raw = incoming }
+      changed = true
+    }
+  }
+  if (key && !v.key) { v.key = key; changed = true }
+  if (sig && !v.sig) { v.sig = sig; changed = true }
+  if (aux && !v.aux) { v.aux = aux; changed = true }
+  if (!v.cardVersion && r.cardVersion) { v.cardVersion = String(r.cardVersion); changed = true }
+  if (!v.imgId && r.imgId) { v.imgId = r.imgId; changed = true }
+  if (changed) v.filledAt = new Date().toISOString()
+  return changed
+}
+
+/**
  * 导入落库
  * @param {object[]} rows
  * @param {{replaceItem?:object}} opt replaceItem：同一批导入里已经确定要合并进去的条目名映射 */
@@ -1310,6 +1881,11 @@ export async function commitImport(rows, opt = {}) {
   const okRows = rows.filter((r) => !r.error && r.payload !== null)
   let created = 0
   let merged = 0
+  /* 补全计数：命中已存在版本时不再是「无视跳过」，而是把残缺版本补成完整版 */
+  let filled = 0
+  /* 空壳跳过：备份包里非角色类别、正文全空的条目直接不建条目（详见下方空壳守卫） */
+  let skippedEmpty = 0
+  const emptyShellSkipped = []
   const duplicates = []
   // 同一批里内容重复的行先内部去重，避免「两个版本变三个版本」
   const seenKeys = new Set()
@@ -1355,37 +1931,75 @@ export async function commitImport(rows, opt = {}) {
     const sig = r.sig || (r.payload ? sigOfPayload(cat, r.payload) : '')
     const key = r.key || keyOfPayload(cat, r.payload)
     r.key = key
+    /* 版本名：默认就是这一版的日期（创建/修改取更早那天，读不到用导入日期），
+       名字可自定义字母汉字；重名才顺延成「xxx 第 N 版」。
+       必须在去重之前算出来 —— 「同基名同日期即同一版本」的合并规则要靠它。 */
+    const baseName = (cat === 'presets' ? (presetVer || (r.version || '').trim()) : (r.version || '').trim()) || day
+    /* 辅助指纹（名称 + 版本名 + 日期）：正文指纹对残缺卡天然失效，靠它兜住 */
+    const aux = auxKeyOfPayload(cat, r.payload, { name: itemName, version: baseName, day })
 
+    /* 同批去重不再「一律跳过」：正文指纹会被残缺卡撞车（同一角色的两个不同版本，
+       描述/开场白相同而 mes_example 不同，指纹完全一样），一律 continue 会把真实版本吞掉。
+       这里只做记录，真正的归并交给下面的槽位 / 指纹 / 跨条目匹配，且填充永不降级。 */
     if (key) {
-      const batchKey = cat + '|' + key
+      const batchKey = cat + '|' + key + '|' + (aux || baseName)
       if (seenKeys.has(batchKey)) {
         duplicates.push(itemName)
-        continue
+      } else {
+        seenKeys.add(batchKey)
       }
-      seenKeys.add(batchKey)
     }
 
     let it = target.find((x) => x.name === itemName)
     // 预设还有一层「归组 key」匹配：名字写法不同的同一预设（Ako / Ako1.91…）也能并成多版本
     if (!it && presetKey) it = target.find((x) => x.presetKey === presetKey)
 
-    // 同一个文件（内容完全一致）已经存在 → 不重复建版本
-    if (it && (it.versions || []).some((v) => versionMatches(v, sig, key))) {
-      duplicates.push(itemName)
+    /* 空壳守卫：备份包里除角色卡以外的条目（世界书 / 预设 / 主题 / 其他）没有 png 内嵌卡可回填，
+       正文全空就说明包里本身就是个空条目，导进来只会堆出一张永远没内容的空卡。
+       库里已有同名条目时照常走下面的合并/补全，不清空已有内容。 */
+    if (!it && cat !== 'characters' && !hasBodyOf(cat, r.payload)) {
+      if (emptyShellSkipped.length < 50) emptyShellSkipped.push(`${cat}/${itemName}`)
+      skippedEmpty++
       continue
+    }
+
+    if (it) {
+      /* ① 先认「同一个版本槽位」：辅助指纹（名称 + 版本名 + 日期）或版本名完全相同。
+         备份包里被剥掉正文的精简 json 与库里的完整版，正文指纹必然不同，只有槽位能认出来；
+         顺序必须在正文指纹之前，否则指纹撞车会把「另一个版本」当成「这一版」直接吞掉。 */
+      const slot = (it.versions || []).find((v) => sameVersionSlot(v, baseName, day, aux))
+      if (slot) {
+        if (fillVersionPayload(slot, r, cat, sig, key, aux)) filled++
+        merged++
+        it.updatedAt = day
+        continue
+      }
+      // ② 再看正文指纹 / 签名：内容完全一样（同一个文件）就是这一版，只补全不新增
+      const hit = (it.versions || []).find((v) => versionMatches(v, sig, key))
+      if (hit) {
+        /* 版本名一样（或行里没有版本名）才算「同一个版本」；
+           版本名不同说明备份包里本就是两行（两张卡正文相同、只有 mes_example 之类的差异），
+           合并会把真实版本吞掉、版本数变少，所以放行让它建自己的版本行。 */
+        const hitName = String(hit.name || '').trim()
+        const sameName = !baseName || hitName === baseName || (!!aux && hit.aux === aux)
+        if (sameName) {
+          if (fillVersionPayload(hit, r, cat, sig, key, aux)) filled++
+          duplicates.push(itemName)
+          continue
+        }
+      }
     }
     // 名称对不上但内容完全一样（同一个文件改了名）也算「该版本已存在」
     if (sig || key) {
-      const same = target.find((x) => (x.versions || []).some((v) => versionMatches(v, sig, key)))
+      const same = target.find((x) => x !== it && (x.versions || []).some((v) => versionMatches(v, sig, key)))
       if (same) {
+        const hit = (same.versions || []).find((v) => versionMatches(v, sig, key))
+        if (hit && fillVersionPayload(hit, r, cat, sig, key, aux)) filled++
         duplicates.push(itemName)
         continue
       }
     }
 
-    // 版本名：默认就是这一版的日期（创建/修改取更早那天，读不到用导入日期），
-  // 名字可自定义字母汉字；重名才顺延成「xxx 第 N 版」
-  const baseName = (cat === 'presets' ? (presetVer || (r.version || '').trim()) : (r.version || '').trim()) || day
     let versionName = baseName
     if (it && (it.versions || []).length) {
       const used = new Set((it.versions || []).map((v) => String(v.name || '')))
@@ -1478,6 +2092,8 @@ export async function commitImport(rows, opt = {}) {
       cardVersion: String(r.cardVersion || '').trim(),
       sig,
       key,
+      /* 辅助指纹（名称 + 版本名 + 日期）：下次导入同一版本时即使正文残缺也能认出「已存在」 */
+      aux,
       imgId: imgId || ''
     }
     if (r.buffer) setVersionBuffer(ver.id, r.buffer)
@@ -1485,6 +2101,18 @@ export async function commitImport(rows, opt = {}) {
     if (!it.date) it.date = day
     it.updatedAt = day
     if (!it.stVersion) it.stVersion = versionName
+    /* 当前版本兜底：旧逻辑里「谁先出现谁当 current」会让空壳版抢占当前版本
+       （详情页读 current 的开场白 → 一片空白）。这里若当前版本是空壳、
+       而刚导入的这版有正文，就把当前版本切到有正文的这版。 */
+    const curVer = (it.versions || []).find((v) => v.current)
+    if (curVer && curVer !== ver && hasBodyOf(cat, ver.raw) && !hasBodyOf(cat, curVer.raw)) {
+      try {
+        curVer.current = false
+        ver.current = true
+        it.stVersion = versionName
+        it.imgId = ver.imgId || it.imgId || ''
+      } catch (_) {}
+    }
     // 当前版本换了图，条目图片跟着换（书架 / 详情页都读这里）
     if (ver.current) it.imgId = ver.imgId || it.imgId || ''
     if (r.srcPath && !it.srcPath) it.srcPath = r.srcPath
@@ -1503,7 +2131,16 @@ export async function commitImport(rows, opt = {}) {
   try {
     tagCategories(store.items)
   } catch (_) {}
-  return { created, merged, dup: duplicates.length, dupNames: duplicates, total: okRows.length }
+  return {
+    created,
+    merged,
+    dup: duplicates.length,
+    dupNames: duplicates,
+    filled,
+    skippedEmpty,
+    skippedEmptyNames: emptyShellSkipped,
+    total: okRows.length
+  }
 }
 
 /* ---------------- 后台任务进度条 ---------------- */
@@ -1550,7 +2187,7 @@ export function endBgJob(hint = '') {
 /** 某条目某版本对应的图片哈希（不传版本就取当前版本） */
 export function coverHashOf(item, version) {
   if (!item) return ''
-  const v = version || (item.versions || []).find((x) => x.current) || (item.versions || [])[0] || null
+  const v = version || bestVersionOf(item) || null
   return (v && v.imgId) || item.imgId || ''
 }
 
@@ -1583,7 +2220,7 @@ export function primeCovers(list, opt = {}) {
     if (all) {
       for (const v of it.versions || []) if (v.imgId) hashes.push(v.imgId)
     } else {
-      const v = (it.versions || []).find((x) => x.current) || (it.versions || [])[0]
+      const v = bestVersionOf(it) || (it.versions || [])[0]
       if (v && v.imgId) hashes.push(v.imgId)
     }
     if (it.imgId) hashes.push(it.imgId)
@@ -1606,7 +2243,7 @@ export async function ensureCoverImages(opt = {}) {
         const h = await saveImageDataUrl(it.cover)
         if (h) {
           if (!it.imgId) it.imgId = h
-          const cur = (it.versions || []).find((v) => v.current) || (it.versions || [])[0]
+          const cur = bestVersionOf(it) || (it.versions || [])[0]
           if (cur && !cur.imgId) cur.imgId = h
           it.cover = ''
           changed = true
@@ -1789,7 +2426,17 @@ export async function checkAppUpdateOnStart(opt = {}) {
     downloadName: (r && r.downloadName) || '',
     downloadDigest: (r && r.downloadDigest) || '',
     downloadSize: Number((r && r.downloadSize) || 0),
-    ignored
+    ignored,
+    /* 链路 / 校验 / 错误分型：设置面板据此显示「走的哪条通道」「校验级别」「为什么失败」 */
+    channel: (r && r.channel) || '',
+    channelLabel: (r && r.channelLabel) || '',
+    verify: (r && r.verify) || '',
+    verifyLabel: (r && r.verifyLabel) || '',
+    manifest: !!(r && r.manifest),
+    manifestNote: (r && r.manifestNote) || '',
+    kind: (r && r.kind) || '',
+    error: (r && r.ok === false && r.error) || '',
+    hint: (r && r.hint) || ''
   }
   /* 有更新时不再额外 toast —— 右下角弹窗已经说清楚了，不重复提示 */
   if (r && r.hasUpdate && opt.toast) showToast(`发现新版本 ${r.latest}`)
@@ -1845,7 +2492,9 @@ export async function startAppUpdate() {
     const r = await a.upDownload({
       url,
       name: store.appUpdate.downloadName || '',
-      sha256: store.appUpdate.downloadDigest || ''
+      /* 清单拿不到 sha256 时 digest 为空，改用大小做降级校验 */
+      sha256: store.appUpdate.downloadDigest || '',
+      size: Number(store.appUpdate.downloadSize || 0)
     })
     if (!r?.ok) {
       store.upd.phase = 'idle'
@@ -2014,37 +2663,80 @@ export async function dismissRollback() {
 }
 
 /* ---------- 酒馆扩展版本校验：更新完第一次打开，不匹配就提示重新注入 ---------- */
-/** 检查酒馆里的扩展版本与软件内置版本是否一致，不一致时点亮 extRemind */
-export async function checkStExtVersion(opt = {}) {
+const EXT_IDLE = { visible: false, installed: true, builtin: '', tavern: '', path: '', busy: false, state: '' }
+
+/** 只读比对：问主进程要一次 extStatus，算出「要不要提示」；不写设置、不碰酒馆文件 */
+async function probeStExt() {
   const a = api()
   const tp = String(store.settings.tavernPath || '').trim()
-  const idle = { visible: false, installed: true, builtin: '', tavern: '', path: '', busy: false }
-  if (!tp || !a?.stExtStatus) return idle
+  if (!tp || !a?.stExtStatus) return { ok: false, reason: 'no-path' }
   let r = null
   try {
     r = await a.stExtStatus({ tavernPath: store.settings.tavernPath, user: store.settings.stUser })
   } catch (_) {
-    return idle
+    return { ok: false, reason: 'error' }
   }
-  if (!r || !r.ok) return idle
+  if (!r || !r.ok) return { ok: false, reason: 'status' }
+  /* 后端发现设置里的用户名在酒馆里并不存在（例如 zztest），已回退到真实用户目录。
+     这里把纠正结果写回设置，后续注入 / 扫描都走同一个用户目录，避免两边各认一个。 */
+  if (r.user && r.userCorrected && String(store.settings.stUser || '') !== String(r.user)) {
+    store.settings.stUser = r.user
+    saveSettings()
+  }
   const builtin = String(r.latest || '')
   const tavern = String(r.version || '')
-  const mismatch = !r.installed || (!!builtin && !!tavern && tavern !== builtin)
+  const state = judgeExtVersion({ installed: !!r.installed, builtin, tavern })
+  return { ok: true, installed: !!r.installed, builtin, tavern, state, path: r.path || '' }
+}
+
+/** 检查酒馆里的扩展版本与软件内置版本是否一致，不一致时点亮 extRemind */
+export async function checkStExtVersion(opt = {}) {
+  const p = await probeStExt()
+  if (!p.ok) return { ...EXT_IDLE }
+  const mismatch = p.state === 'missing' || p.state === 'upgrade' || p.state === 'newer'
   store.extRemind = {
     visible: !!mismatch,
-    installed: !!r.installed,
-    builtin,
-    tavern,
-    path: r.path || '',
-    busy: false
+    installed: p.installed,
+    builtin: p.builtin,
+    tavern: p.tavern,
+    path: p.path,
+    busy: false,
+    state: p.state
   }
   if (mismatch && opt.toast) {
-    showToast(r.installed ? '酒馆扩展版本与软件不一致，需要重新注入' : '酒馆扩展还没装进酒馆')
+    if (p.state === 'upgrade') showToast('软件内置的扩展 v' + p.builtin + ' 比酒馆里的 v' + p.tavern + ' 新，可重新注入升级')
+    else if (p.state === 'newer') showToast('酒馆里的扩展 v' + p.tavern + ' 比软件内置的 v' + p.builtin + ' 新，无需注入')
+    else showToast('酒馆扩展还没装进酒馆')
   }
   return store.extRemind
 }
 
-/** 弹窗里点「重新注入」：把扩展重写一遍再复查版本 */
+/** 启动自动比对酒馆扩展版本（每次启动只跑一次）
+ * 定位：独立于 GitHub 自身版本检查与 DC 更新检查的后台比对，晚几秒静默跑；
+ * 只调用一次 extStatus 做读操作，不写盘、不自动注入、不弹窗打断：
+ *   - 没配酒馆路径 / 扩展没装 / 读取或网络异常 → 静默返回，不留任何提示
+ *   - 内置版本比酒馆里的新 → 点亮既有提示卡（角标同一入口，卡片里可直接重新注入）
+ *   - 已是最新、或酒馆里的比内置新（软件被回退过）→ 静默，免得误导用户降级
+ * 守卫用模块级标记，热重载或重复调用都不会发第二次请求。 */
+let stExtAutoStarted = false
+export async function autoCheckStExtOnStart() {
+  if (stExtAutoStarted) return null
+  stExtAutoStarted = true
+  const p = await probeStExt()
+  if (!p.ok || !p.installed) return null
+  store.extRemind = {
+    visible: p.state === 'upgrade',
+    installed: true,
+    builtin: p.builtin,
+    tavern: p.tavern,
+    path: p.path,
+    busy: false,
+    state: p.state === 'upgrade' ? 'upgrade' : ''
+  }
+  return store.extRemind
+}
+
+/** 弹窗里点「重新注入」：交给主进程按版本比对（旧版升级 / 同版本不重写）再复查版本 */
 export async function reInjectStExt() {
   const a = api()
   if (!a?.stExtInject) return showToast('请在桌面版里使用')
@@ -2057,7 +2749,9 @@ export async function reInjectStExt() {
       return null
     }
     await checkStExtVersion()
-    showToast('已重新注入扩展 v' + (r.version || ''))
+    const ver = r.version || ''
+    if (r.skipped) showToast(r.message || '酒馆里已是 v' + ver + '，未重写')
+    else showToast((r.message || '已写入扩展 v' + ver) + '，刷新酒馆页面生效')
     return r
   } finally {
     store.extRemind.busy = false
@@ -2277,8 +2971,12 @@ export async function makeImportRowFromPath(p, source = 'scan') {
   if (!row.version) row.version = row.date || ''
   if (row.payload) row.sig = sigOfPayload(row.category, row.payload)
   /* 名称是自动解析出来的（不是用户手打的）：抓到 Discord 帖子标题时允许覆盖，
-     用户一旦在导入界面手动改过名称，这个标记会变成 false，之后不再覆盖。 */
-  row.nameAuto = true
+     用户一旦在导入界面手动改过名称，这个标记会变成 false，之后不再覆盖。
+     注意：解析阶段已经按「名字来自卡片内容还是文件名」判过一次，
+     卡片自带的角色名会带着 nameAuto=false 进来，这里不能无条件改回 true，
+     否则帖子标题会把角色名顶掉（图片直链 + 帖子链接同时导入时就是这个现象）。 */
+  if (typeof row.nameAuto !== 'boolean') row.nameAuto = true
+  if (!row.nameSource) row.nameSource = row.nameAuto ? 'file' : 'card'
   return row
 }
 
@@ -2447,34 +3145,78 @@ export function sigOfPayload(category, payload) {
 export async function ensureItemDigests(item) {
   if (!item) return
   const cat = resolveCat(item)
-  const kind = cat === 'others' ? othersKind(item) : cat
   const a = apiOf()
+  /* 「其他」分类不写死成某一类：以前这里用 othersKind(item) 一锤定音，而 othersKind 只看
+     v.raw —— 原文落侧车（rawFile）时 raw 是 undefined，于是所有「其他」条目都被当成世界书
+     算指纹，预设/美化永远算不出同一个值，对比自然一直「不一致」。
+     现在「其他」把三类指纹都算出来存进 v.digests，比中任意一个都算一致。 */
+  const kinds = cat === 'others' ? ['worldbooks', 'presets', 'themes'] : [cat]
   for (const v of item.versions || []) {
-    if (!v || v.digest) continue
+    if (!v) continue
+    if (v.digest && (cat !== 'others' || Array.isArray(v.digests) && v.digests.length)) continue
+    let got = false
     /* 侧车原文可能几十 MB：交给主进程读盘算 digest，渲染进程不读、不解析大 JSON */
     if (!v.raw && v.rawFile && a && a.dataDigest) {
-      try {
-        const rr = await a.dataDigest({ sub: 'raw', name: v.rawFile, category: kind })
-        if (rr && rr.ok && rr.digest) {
-          v.digest = rr.digest
-          continue
-        }
-      } catch (_) {}
+      const ds = []
+      for (const k of kinds) {
+        try {
+          const rr = await a.dataDigest({ sub: 'raw', name: v.rawFile, category: k })
+          if (rr && rr.ok && rr.digest) ds.push(rr.digest)
+        } catch (_) {}
+      }
+      if (ds.length) {
+        const uniq = Array.from(new Set(ds))
+        v.digest = uniq[0]
+        if (uniq.length > 1) v.digests = uniq
+        got = true
+      }
     }
+    if (got) continue
     const raw = v.raw || (await ensureVersionRaw(item, v))
     if (!raw) continue
-    try {
-      const d = digestOf(kind, raw)
-      if (d) v.digest = d
-    } catch (_) {}
+    const ds = []
+    for (const k of kinds) {
+      try {
+        const d = digestOf(k, raw)
+        if (d) ds.push(d)
+      } catch (_) {}
+    }
+    if (!ds.length) continue
+    const uniq = Array.from(new Set(ds))
+    v.digest = uniq[0]
+    if (uniq.length > 1) v.digests = uniq
   }
+}
+
+/** 某个版本可用来比对的全部指纹（「其他」会有多个候选算法） */
+function versionDigests(v) {
+  if (!v) return []
+  const out = []
+  if (v.digest) out.push(String(v.digest))
+  if (Array.isArray(v.digests)) for (const d of v.digests) if (d) out.push(String(d))
+  return out
+}
+
+/** 按内容指纹找版本：命中就说明酒馆里那份与本版本内容一致 */
+function findVersionByDigest(vers, digest) {
+  if (!digest) return null
+  const d = String(digest)
+  for (const v of vers || []) if (v && versionDigests(v).includes(d)) return v
+  return null
+}
+
+/** 条目全部版本的指纹集合（按内容召回酒馆同名项用） */
+function itemDigestSet(item) {
+  const s = new Set()
+  for (const v of (item && item.versions) || []) for (const d of versionDigests(v)) s.add(d)
+  return s
 }
 
 export async function refreshTavernCompare(item, opts = {}) {
   if (!item) return { ok: false, error: 'NoItem' }
   await ensureItemDigests(item)
   const a = api()
-  if (!a || (!a.stScanCharacters && !a.stScanWorlds && !a.stScanPresets)) {
+  if (!a || (!a.stScanCharacters && !a.stScanWorlds && !a.stScanPresets && !a.stScanThemes)) {
     item.stCards = []
     return { ok: false, error: 'NO_BRIDGE' }
   }
@@ -2482,55 +3224,135 @@ export async function refreshTavernCompare(item, opts = {}) {
   return applyTavernCompare(item, r)
 }
 
-/** 一个条目在酒馆里的同名项（角色卡按名字/头像，世界书与预设按名字） */
-function tavernSameName(list, item, kind) {
-  const name = String(item.name || '')
-  if (kind === 'characters') {
-    /* 酒馆允许同名角色并存，靠「名字 + 后缀」区分（方亦楷 / 方亦楷哇哦 / 方亦楷哦哦）。
-       只认完全相等会漏掉这些副本，合并后的条目就永远找不到它们、更新时也不弹选择。
-       这里把「以条目名开头、后缀不超过 12 字」的卡也算候选，再加上合并时记下的别名。 */
-    const aliases = new Set()
-    for (const a of item.stAliases || []) for (const av of a.avatars || []) aliases.add(String(av))
-    if (item.stAvatar) aliases.add(String(item.stAvatar))
-    if (!name) return []
-    /* 酒馆靠文件名区分同名卡：(1)/(2)、2.0 这类尾缀都算同一角色的副本，先归一化再比 */
-    const norm = (x) =>
-      String(x || '')
-        .replace(/\s*\(\d+\)\s*$/, '')
-        .replace(/[\s_-]*\d+(\.\d+)*$/, '')
-        .trim()
-        .toLowerCase()
-    const nameNorm = norm(name)
-    const exact = []
-    const loose = []
-    for (const c of list) {
-      const nm = String(c.name || '')
-      const av = String(c.avatar || '')
-      if (nm === name || av === name || aliases.has(av) || aliases.has(nm)) {
-        exact.push(c)
-        continue
-      }
-      if (norm(nm) === nameNorm || norm(av) === nameNorm) {
-        exact.push(c)
-        continue
-      }
-      for (const s of [nm, av]) {
-        if (s.length > name.length && s.startsWith(name) && s.length - name.length <= 12) {
-          loose.push(c)
-          break
-        }
-      }
-    }
-    /* 有同名本体时就不再往里塞「名字 + 后缀」的卡，免得把别的角色（比如 方亦楷的邻居）算成副本 */
-    return exact.length ? exact : loose
+/** 角色卡名字归一化：(1)/(2) 副本尾缀、2.0 / 2 这类版本尾缀、「名字 + 短后缀」都收敛到同一基名 */
+function normCardName(x) {
+  return String(x || '')
+    .replace(/\s*\(\d+\)\s*$/, '')
+    .replace(/[\s_-]*\d+(\.\d+)*$/, '')
+    .trim()
+    .toLowerCase()
+}
+
+/**
+ * 角色卡候选召回（只召回，不定案）：已登记绑定 ∪ 卡内名精确 ∪ 归一化命中 ∪ 文件名包含。
+ * 以前只认「完全相等 / 归一化相等」，且一命中就丢掉其余候选，导致
+ * ① 卡内真名与文件名不同的卡召不回来（dk方亦楷.png 里 name=方亦楷）；
+ * ② 同内容多卡被合并成一张。
+ * 现在全部候选都进列表，由 applyTavernCompare 按「内容指纹 → 卡内名 → 绑定」定案。
+ * @returns {Array<object>} 每项带 recall: string[]（bound / name / norm / file）
+ */
+function recallCharacters(list, item) {
+  const name = String((item && item.name) || '').trim()
+  if (!name) return []
+  const bound = new Set()
+  for (const al of item.stAliases || []) for (const av of al.avatars || []) bound.add(String(av))
+  if (item.stAvatar) bound.add(String(item.stAvatar))
+  for (const c of item.stCards || []) if (c && c.avatar) bound.add(String(c.avatar))
+  const nameNorm = normCardName(name)
+  const key = name.toLowerCase()
+  const out = []
+  for (const c of list) {
+    const nm = String(c.name || '')
+    const av = String(c.avatar || '')
+    const detail = c.hasCard !== null && c.hasCard !== undefined
+    /* 酒馆侧卡名是 {{char}} 之类占位符时不算真名，别拿它去精确匹配 */
+    const realName = detail ? cleanCardName(nm, '') : ''
+    const recall = []
+    if (bound.has(av) || (detail && bound.has(nm))) recall.push('bound')
+    /* 卡内名精确只看详扫结果：轻扫的 name 就是文件名，拿它当卡名会把「文件名命中」伪装成「卡名命中」 */
+    if (realName && realName === name) recall.push('name')
+    if (!recall.includes('name') && (normCardName(realName) === nameNorm || normCardName(av) === nameNorm)) recall.push('norm')
+    if (av === name || av.toLowerCase().includes(key) || (realName && realName.toLowerCase().includes(key))) recall.push('file')
+    if (!recall.length) continue
+    out.push({ ...c, recall })
   }
-  if (kind === 'worldbooks') return list.filter((w) => String(w.name || '') === name)
-  return list.filter((p) => String(p.name || '') === name)
+  const rank = (c) => {
+    if (c.recall.includes('bound')) return 0
+    if (c.recall.includes('name')) return 1
+    if (c.recall.includes('norm')) return 2
+    return 3
+  }
+  out.sort((a, b) => rank(a) - rank(b) || String(a.avatar).localeCompare(String(b.avatar)))
+  return out
+}
+
+/** 世界书 / 预设 / 美化 的名字归一化：(1) 副本尾缀、文件后缀、空格、大小写都不参与比较 */
+function normSameName(x) {
+  return String(x || '')
+    .replace(/\.(json|png)$/i, '')
+    .replace(/\s*\(\d+\)\s*$/, '')
+    .replace(/\s+/g, '')
+    .trim()
+    .toLowerCase()
+}
+
+/**
+ * 世界书 / 预设 / 美化的同名召回：条目名精确 → 归一化相等 → 文件名相等 → 已登记的目标路径
+ * → **内容指纹一致** → 去掉版本尾缀后互相包含。
+ * 以前只认「条目名 === 酒馆项名」，可酒馆里的名字来自 JSON 内的 name 或文件名、还常带 ·V1.4.0、
+ * 「(1)」这类副本尾缀，一旦不一致就召不回来，界面上看着就是「对比没反应」。
+ * 内容指纹这一路是兜底：名字再怎么写歪，只要内容一致就照样能比出来。
+ */
+function recallSameNamed(list, item) {
+  const name = String(item.name || '')
+  const key = normSameName(name)
+  /* 去掉 v2.1 / 2.1.0 / 第2版 / [V2] 这类版本尾缀后的基名，用来做「弱召回」 */
+  const base = key
+    .replace(/[\[\(【（]?[vV]?\s*\d+(\.\d+)*[\]\)】）]?$/, '')
+    .replace(/第[0-9一二三四五六七八九十]+版$/, '')
+    .trim()
+  const digests = itemDigestSet(item)
+  const paths = new Set()
+  const addPath = (p) => {
+    const s = String(p || '').trim()
+    if (!s) return
+    paths.add(s.toLowerCase())
+    const b = s.split(/[\\/]/).pop()
+    if (b) paths.add(b.toLowerCase())
+  }
+  addPath(item.stTargetPath)
+  for (const c of item.stCards || []) {
+    addPath(c && c.path)
+    addPath(c && c.file)
+  }
+  const weak = (k) => {
+    if (!base || base.length < 4 || !k) return false
+    const kb = k
+      .replace(/[\[\(【（]?[vV]?\s*\d+(\.\d+)*[\]\)】）]?$/, '')
+      .replace(/第[0-9一二三四五六七八九十]+版$/, '')
+      .trim()
+    if (!kb || kb.length < 4) return false
+    return kb.includes(base) || base.includes(kb)
+  }
+  const out = []
+  for (const c of list) {
+    const nm = String(c.name || '')
+    const file = String(c.file || '')
+    const p = String(c.path || '')
+    const recall = []
+    if (nm === name) recall.push('name')
+    if (!recall.length && key && (normSameName(nm) === key || (file && normSameName(file) === key))) recall.push('name')
+    if (!recall.length && ((file && paths.has(file.toLowerCase())) || (p && paths.has(p.toLowerCase())))) recall.push('path')
+    if (!recall.length && c.digest && digests.has(String(c.digest))) recall.push('content')
+    if (!recall.length && (weak(normSameName(nm)) || (file && weak(normSameName(file))))) recall.push('weak')
+    if (!recall.length) continue
+    out.push({ ...c, recall })
+  }
+  /* 强依据在前，内容一致其次，弱名字包含放最后 */
+  const rank = (c) => (c.recall.includes('name') ? 0 : c.recall.includes('path') ? 1 : c.recall.includes('content') ? 2 : 3)
+  out.sort((a, b) => rank(a) - rank(b) || String(a.name || a.file).localeCompare(String(b.name || b.file)))
+  return out
+}
+
+/** 一个条目在酒馆里的同名项（角色卡按名字/头像/内容召回，世界书与预设与美化按名字/文件名召回） */
+function tavernSameName(list, item, kind) {
+  if (kind === 'characters') return recallCharacters(list, item)
+  return recallSameNamed(list, item)
 }
 
 /** 「其他」按内容判断它在酒馆里更像世界书还是预设 */
 function othersKind(item) {
-  const v = (item.versions || []).find((x) => x.current) || (item.versions || [])[0]
+  const v = bestVersionOf(item) || (item.versions || [])[0]
   const raw = v && v.raw
   if (!raw || typeof raw !== 'object') return 'worldbooks'
   if (Array.isArray(raw.prompts) || Array.isArray(raw.prompt_order)) return 'presets'
@@ -2540,7 +3362,7 @@ function othersKind(item) {
 async function scanTavernForCompare(cats, item, opts = {}) {
   const a = api()
   const opt = { tavernPath: store.settings.tavernPath, user: store.settings.stUser }
-  const out = { characters: [], worldbooks: [], presets: [], errors: [] }
+  const out = { characters: [], worldbooks: [], presets: [], themes: [], errors: [] }
   const need = new Set(cats || [])
   if (need.has('others')) {
     out.othersWorlds = []
@@ -2548,27 +3370,34 @@ async function scanTavernForCompare(cats, item, opts = {}) {
   }
   if (need.has('characters') && a?.stScanCharacters) {
     /* 全量解析 170 张卡的 PNG + JSON 要 1 秒左右，主进程被占住，界面上就是「点进详情卡一下」。
-       没要求全量时先轻扫拿名单（只 stat 不解析内容），再只详细解析「名字对得上」的那几张。 */
+       没要求全量时先轻扫拿名单（只 stat 不解析内容），再对召回出来的候选做详扫。
+       铁律：进入配对的一律是详扫结果 —— 轻扫项没有卡内真名与内容指纹，
+       拿它配对只能按文件名猜，正是「名字显示不一致 / 漏配错配」的根子。 */
+    const detailed = (list) => (list || []).filter((c) => c && c.hasCard !== null && c.hasCard !== undefined)
     if (item && !opts.full) {
       const lite = await a.stScanCharacters({ ...opt, light: true })
       if (!lite?.ok) {
         out.errors.push(lite?.error || '找不到酒馆角色卡目录')
       } else {
-        const key = String(item.name || '').trim().toLowerCase()
-        const cand = new Set()
-        for (const c of item.stCards || []) if (c && c.avatar) cand.add(String(c.avatar))
-        if (item.stAvatar) cand.add(String(item.stAvatar))
-        for (const c of lite.list || []) {
-          const av = String(c.avatar || '').toLowerCase()
-          if (!key || av === key || av.includes(key)) cand.add(c.avatar)
+        const cands = recallCharacters(lite.list || [], item)
+        let list = []
+        if (cands.length) {
+          const r = await a.stScanCharacters({ ...opt, only: cands.map((c) => c.avatar) })
+          if (r?.ok) list = detailed(r.list)
+          else out.errors.push(r?.error || '找不到酒馆角色卡目录')
         }
-        const r = cand.size ? await a.stScanCharacters({ ...opt, only: Array.from(cand) }) : lite
-        if (r?.ok) out.characters = r.list || []
-        else out.errors.push(r?.error || '找不到酒馆角色卡目录')
+        /* 候选一个都没召回时全量详扫兜底：卡内真名与文件名都对不上（小方.png 里 name=方亦楷）
+           的情况只能靠详扫发现，不能因为轻扫没命中就断定酒馆里没有 */
+        if (!list.length) {
+          const full = await a.stScanCharacters(opt)
+          if (full?.ok) list = detailed(full.list)
+          else if (full?.error) out.errors.push(full.error)
+        }
+        out.characters = list
       }
     } else {
       const r = await a.stScanCharacters(opt)
-      if (r?.ok) out.characters = r.list || []
+      if (r?.ok) out.characters = detailed(r.list)
       else out.errors.push(r?.error || '找不到酒馆角色卡目录')
     }
   }
@@ -2580,64 +3409,168 @@ async function scanTavernForCompare(cats, item, opts = {}) {
     const r = await a.stScanPresets({ ...opt, includeSamplerPresets: true })
     if (r?.ok) out.presets = r.list || []
   }
+  /* 美化以前完全没进对比链路：预设/美化的详情页永远看不到「酒馆里有没有同名项」，
+     所以「对比功能不生效」。这里按分类把 themes/*.json 也扫进来。
+     「其他」里也可能躺着美化，所以 others 一起带上。 */
+  if ((need.has('themes') || need.has('others')) && a?.stScanThemes) {
+    const r = await a.stScanThemes(opt)
+    if (r?.ok) out.themes = r.list || []
+    else if (r?.error) out.errors.push(r.error)
+  }
+  /* 世界书 / 预设 / 美化的扫描结果只有名字、大小、时间，没有内容指纹；
+     而「与某个版本一致」全靠指纹比对，不在这里补算就永远只能判「不一致」 */
+  await attachTavernDigests(a, out)
   return out
+}
+
+/**
+ * 给扫描结果补算酒馆侧内容指纹（只读命中的那几个文件，不做全库解析）。
+ * 失败一律静默跳过：没有指纹时退化为按名字比对，不影响其余分类。
+ */
+async function attachTavernDigests(a, scan) {
+  if (!a?.stProbeDigests) return
+  const jobs = [
+    ['worldbooks', scan.worldbooks],
+    ['presets', scan.presets],
+    ['themes', scan.themes]
+  ]
+  for (const [kind, list] of jobs) {
+    if (!Array.isArray(list) || !list.length) continue
+    try {
+      const r = await a.stProbeDigests({
+        kind,
+        files: list.map((x) => ({ path: x.path, name: x.name, engine: x.engine }))
+      })
+      if (!r?.ok || !Array.isArray(r.list)) continue
+      const byPath = new Map()
+      for (const x of r.list) {
+        const k = String((x && x.path) || '').toLowerCase()
+        if (k) byPath.set(k, x)
+      }
+      for (const it of list) {
+        const hit = byPath.get(String(it.path || '').toLowerCase())
+        if (hit && hit.digest) it.digest = hit.digest
+      }
+    } catch (_) {}
+  }
 }
 
 function applyTavernCompare(item, scan) {
   const cat = resolveCat(item)
   const vers = item.versions || []
-  const type = cat === 'others' ? othersKind(item) : cat
-  const list = type === 'presets' ? scan.presets : type === 'worldbooks' ? scan.worldbooks : scan.characters
+  /* 「其他」不再靠 othersKind 猜一类：原文常在侧车里、raw 拿不到时它永远猜成世界书，
+     于是挂在「其他」里的预设/美化一个都召不回来。现在把三类候选合起来一起比。 */
+  const type = cat
+  const tag = (arr, k) => (arr || []).map((x) => ({ ...x, _kind: x._kind || k }))
+  const list =
+    type === 'presets'
+      ? tag(scan.presets, 'presets')
+      : type === 'themes'
+        ? tag(scan.themes, 'themes')
+        : type === 'worldbooks'
+          ? tag(scan.worldbooks, 'worldbooks')
+          : type === 'others'
+            ? [
+                ...tag(scan.worldbooks, 'worldbooks'),
+                ...tag(scan.presets, 'presets'),
+                ...tag(scan.themes, 'themes')
+              ]
+            : scan.characters || []
   const mine = tavernSameName(list, item, type)
+  /* 覆盖 stCards 之前先记下真正的「已登记绑定」：条目当前绑定的那张 + 合并时记下的别名。
+     不能把上一轮的候选列表整批当绑定，否则「上次只是召回过」会被误当成「已经确认绑过」。 */
+  const prevAvatar = String(item.stAvatar || '')
+  const boundSet = new Set()
+  if (prevAvatar) boundSet.add(prevAvatar)
+  for (const al of item.stAliases || []) for (const av of al.avatars || []) boundSet.add(String(av))
 
   item.stCards = mine.map((c) => {
     if (type === 'characters') {
-      /* 先比内容指纹（digest：名字 + 正文 + 首条消息），再退回旧版 sig，
-         最后才用「酒馆里记住的版本名」兜底。四类共用同一套判据。 */
-      const v =
-        vers.find((x) => x.digest && c.digest && x.digest === c.digest) ||
-        vers.find((x) => x.sig && c.sig && x.sig === c.sig)
-      const nameMatch = vers.find((x) => !x.digest && !x.sig && x.name === item.stVersion)
-      const hit = v || nameMatch || null
+      /* 定案顺序：内容指纹 → 卡内名精确 → 已登记绑定 → 未匹配。
+         以前是「谁先命中谁算」，同一张卡同时满足多条时来源标不出来；
+         归一化（剥尾缀）只用来召回，绝不能单独定案，否则 方亦楷 / 方亦楷的邻居 会被并成一张。 */
+      const detail = c.hasCard !== null && c.hasCard !== undefined
+      const hit =
+        findVersionByDigest(vers, c.digest) ||
+        vers.find((x) => x.sig && c.sig && x.sig === c.sig) ||
+        null
+      const iname = detail ? cleanCardName(c.name, '') : ''
+      const nameExact = !!iname && iname === String(item.name || '')
+      let by = 'none'
+      if (hit) by = 'content'
+      else if (nameExact) by = 'name'
+      else if (boundSet.has(String(c.avatar || ''))) by = 'bound'
       return {
         avatar: c.avatar,
-        name: c.name,
+        name: iname || c.avatar,
+        file: c.file || `${c.avatar}.png`,
         sig: c.sig,
         digest: c.digest || '',
         world: c.world || '',
+        worlds: Array.isArray(c.worlds) ? c.worlds : [],
+        /* same 只表示「内容与某个版本一致」，来源另看 by */
         same: !!hit,
+        by,
+        recall: Array.isArray(c.recall) ? c.recall : [],
         matchVersionId: hit ? hit.id : '',
         matchVersionName: hit ? hit.name : ''
       }
     }
-    /* 世界书 / 预设：「其他」里也是这两类。以前拿 item.stVersion（酒馆记住的版本名）
+    /* 世界书 / 预设 / 美化：「其他」里也是这几类。以前拿 item.stVersion（酒馆记住的版本名）
        之外还试过用「版本名 === 酒馆世界书名」，两边根本不是同一套命名，所以永远标不出来。
-       现在统一按内容指纹比对，酒馆侧 c.digest 由主进程读文件算出。 */
-    const hit =
-      vers.find((x) => x.digest && c.digest && x.digest === c.digest) ||
-      vers.find((x) => x.name === item.stVersion) ||
-      null
+       现在统一按内容指纹比对（「其他」会把三类算法都算一遍），酒馆侧 c.digest 由主进程读文件算出；
+       确实没有指纹可比时（例如酒馆那侧不是合法 JSON）才退回按版本名配对。 */
+    const hit = findVersionByDigest(vers, c.digest) || vers.find((x) => x.name && x.name === item.stVersion) || null
     return {
       avatar: c.path || c.name,
-      name: c.name,
+      name: c.name || c.file || '',
+      file: c.file || '',
       sig: '',
       digest: c.digest || '',
-      kind: type,
+      kind: c._kind || type,
       engine: c.engine || '',
       path: c.path || '',
-      same: true,
+      same: !!hit,
+      by: !hit ? 'none' : hit.digest || hit.digests ? 'content' : 'name',
+      recall: Array.isArray(c.recall) ? c.recall : [],
       matchVersionId: hit ? hit.id : '',
       matchVersionName: hit ? hit.name : ''
     }
   })
-  if (type === 'characters' && mine.length && !item.stCards.some((c) => c.avatar === item.stAvatar)) {
-    item.stAvatar = mine[0].avatar
+  if (type === 'characters') {
+    /* 自动回填只认有依据的那一种：仍绑着上一轮那张卡就继续绑；否则只在「唯一」的强命中
+       （内容一致 / 卡名精确）上回填。多张并列或毫无依据时留空由用户重新绑定 ——
+       以前这里无脑取 mine[0].avatar，把 V2.0 的条目绑到了 方亦楷 (1).png 上。 */
+    const cards = item.stCards
+    if (!prevAvatar || !cards.some((c) => c.avatar === prevAvatar)) {
+      const strong = cards.filter((c) => c.by === 'content' || c.by === 'name')
+      item.stAvatar = strong.length === 1 ? strong[0].avatar : ''
+    }
   }
   if (type !== 'characters' && mine.length && !item.stTargetPath) item.stTargetPath = mine[0].path || ''
-  item.stCardsTotal = mine.length
+  item.stCardsTotal = item.stCards.length
+  /* 张数 ≠ 角色数：名字相同但内容不同的多份副本，角色名只有一个 */
+  item.stNameCount = new Set(item.stCards.map((c) => String(c.name || c.avatar || ''))).size
   item.stCheckedAt = nowStr()
-  if (!mine.length) return { ok: true, list: [], error: scan.errors[0] || '' }
+  /* 扫描失败原因留在条目上：界面上要能说清「为什么一个都没比出来」（例如酒馆主题目录不存在），
+     否则用户只会看到「还没有这个美化」，误以为对比功能又坏了 */
+  item.stError = scan.errors && scan.errors.length ? String(scan.errors[0] || '') : ''
+  if (!mine.length) return { ok: true, list: [], error: item.stError }
   return { ok: true, list: item.stCards }
+}
+
+/**
+ * 把条目绑定到酒馆里某一张卡（只写资料库自身数据，绝不改动酒馆文件）。
+ * 用于「绑定与内容不符」时由用户手动改绑。
+ */
+export function bindTavernCard(item, avatar) {
+  if (!item) return false
+  const av = String(avatar || '')
+  item.stAvatar = av
+  const hit = (item.stCards || []).find((c) => c && c.avatar === av)
+  item.stTargetPath = hit && hit.path ? hit.path : item.stTargetPath || ''
+  try { saveItems() } catch (_) {}
+  return true
 }
 
 /** 一批条目一起对比（导入后 / 打开详情时用）：同一类只扫一次 */
@@ -2688,6 +3621,16 @@ export function isTavernVersion(item, version) {
 
 /* ---------------- 推到酒馆：新建 / 替换更新 ---------------- */
 
+/** 占位符卡名（{{char}} 之类）不是真名，展示与匹配都不能用它 */
+const CARD_PLACEHOLDER = /^\{\{\s*(char|user|persona|original|user_name)\s*\}\}$/i
+
+/** 卡内真名清洗：空/占位符 → 回退给 fallback（一般是文件名 stem） */
+function cleanCardName(name, fallback) {
+  const n = String(name || '').trim()
+  if (!n || CARD_PLACEHOLDER.test(n)) return String(fallback || '').trim()
+  return n
+}
+
 /**
  * 条目在酒馆里的文件名（avatar）：显式传入 > 记录值 > 已写入路径的文件名 > 同名卡扫描结果 */
 function stAvatarOf(item, opt = {}) {
@@ -2699,11 +3642,48 @@ function stAvatarOf(item, opt = {}) {
     if (base) return base
   }
   const cards = item.stCards || []
+  /* 只有「内容一致」或「卡内真名一致」才算有依据的默认目标。
+     以前这里还有 cards[0] 兜底：酒馆里有多份同名副本时，取第一张等于随机写一张。 */
   const hit =
-    cards.find((c) => c.same) ||
-    cards.find((c) => c.avatar === item.name || c.name === item.name) ||
-    cards[0]
+    cards.find((c) => c && c.same && c.by === 'content') ||
+    cards.find((c) => c && c.name && c.name === item.name) ||
+    null
   return hit ? String(hit.avatar || '') : ''
+}
+
+/** 取角色卡 JSON 的卡内真名；空 / 占位符时回退到给的备用名 */
+function cardDisplayName(json, fallback) {
+  const d = json && json.data ? json.data : json || {}
+  return cleanCardName(d && d.name, fallback) || '未命名'
+}
+
+/** 角色卡 JSON 里绑定的世界书名（extensions.world 优先，其次内嵌书的名字） */
+function cardWantWorld(json) {
+  const d = json && json.data ? json.data : json || {}
+  const w = String((d && d.extensions && d.extensions.world) || '')
+  if (w) return w
+  return String((d && d.character_book && d.character_book.name) || '')
+}
+
+/**
+ * 按需取库内同名世界书的内容，交给主进程补写酒馆 worlds。
+ * 只为消除「卡内 extensions.world 指向不存在的文件」这种悬空引用；
+ * 主进程只在目标文件缺失时写，绝不覆盖酒馆已有世界书。
+ */
+async function worldSourceFor(name) {
+  const key = String(name || '').trim()
+  if (!key) return undefined
+  let books = []
+  try { books = (store.items && store.items.worldbooks) || [] } catch (_) { books = [] }
+  const hit = books.find((b) => b && String(b.name || '').trim() === key)
+  if (!hit) return undefined
+  const vs = hit.versions || []
+  const v = vs.find((x) => x && x.current) || vs[0]
+  if (!v) return undefined
+  try { await ensureVersionRaw(hit, v) } catch (_) {}
+  const raw = v.raw
+  if (!raw || typeof raw !== 'object') return undefined
+  return { name: key, data: toPlain(raw) }
 }
 
 /** 体积人性化：聊天记录动辄几百 KB，直接给字节数看不出量级 */
@@ -2712,6 +3692,15 @@ function humanSize(n) {
   if (b < 1024) return `${b} B`
   if (b < 1048576) return `${(b / 1024).toFixed(0)} KB`
   return `${(b / 1048576).toFixed(1)} MB`
+}
+
+/** 命中的依据（与界面上的一致性标记同源）：按内容 / 按卡名 / 已绑定 / 未匹配 */
+export function stByText(c) {
+  if (!c) return ''
+  if (c.by === 'content') return '按内容'
+  if (c.by === 'name') return '按卡名'
+  if (c.by === 'bound') return '已绑定'
+  return '未匹配'
 }
 
 /**
@@ -2727,9 +3716,11 @@ export async function withTavernTarget(item, unit, onPick) {
   } catch (_) {}
   const cards = (item && item.stCards) || []
   if (!cards.length) return onPick(null)
+  /* 名字与文件名不是一回事（卡内真名 vs 酒馆里的 xxx.png），提示里两个都给 */
+  const label = (c) => `${c.name || c.avatar}（${c.file || c.avatar + '.png'}）`
   /* 只有一张同名卡 → 不打扰，直接写这张，只留一条提示说明写到哪了 */
   if (cards.length === 1) {
-    showToast(`酒馆里只有一张「${cards[0].avatar}」，直接更新它`)
+    showToast(`酒馆里只有一张「${label(cards[0])}」，直接更新它`)
     return onPick(cards[0])
   }
   const evt = {
@@ -2742,15 +3733,14 @@ export async function withTavernTarget(item, unit, onPick) {
   const build = (stats) =>
     cards.map((c) => {
       const cs = (stats && stats[c.avatar]) || { count: 0, total: 0, files: [] }
-      const lines = [
-        cs.count ? `聊天记录 ${cs.count} 个 · 合计 ${humanSize(cs.total)}` : '聊天记录 0 个'
-      ]
+      const lines = [`文件：${c.file || c.avatar + '.png'}`]
+      lines.push(cs.count ? `聊天记录 ${cs.count} 个 · 合计 ${humanSize(cs.total)}` : '聊天记录 0 个')
       for (const f of (cs.files || []).slice(0, 3)) lines.push(`· ${f.name}  ${humanSize(f.size)}`)
       if (cs.count > 3) lines.push(`· …另有 ${cs.count - 3} 个聊天记录`)
       return {
-        label: `写入「${c.avatar}」`,
+        label: `写入「${c.name || c.avatar}」`,
         desc: lines.join('\n'),
-        hint: c.same ? '内容一致' : '不一致',
+        hint: stByText(c),
         action: () => onPick(c)
       }
     })
@@ -2766,14 +3756,15 @@ export async function withTavernTarget(item, unit, onPick) {
   } else {
     openMenu(evt, build(null))
   }
-  showToast(`酒馆里有 ${cards.length} 个同名${unit || '条目'}，请选择要写入的那一个`)
+  showToast(`酒馆里有 ${cards.length} 张同名${unit || '条目'}，请选择要写入的那一张`)
 }
 
 /**
  * 推到酒馆：新建 / 替换更新
+ * 新建（mode:'new'）= 直接新建一份：不判同族、不问覆盖，同族/同名时主进程自动另起独立基名。
  * @param {object} item
  * @param {{mode?:'new'|'replace', version?:object, stAvatar?:string,
- *          replaceWorld?:boolean, backupOldWorld?:boolean}} opt
+ *          replaceWorld?:boolean, backupOldWorld?:boolean, silent?:boolean}} opt
  */
 export async function pushItemToTavern(item, opt = {}) {
   if (!item) return { ok: false, error: '没有条目' }
@@ -2783,6 +3774,11 @@ export async function pushItemToTavern(item, opt = {}) {
   }
 
   if (!store.stStatus.connected) await checkStConnection()
+
+  /* 批量流程（opt.silent）不逐条弹提示、也不弹任何询问菜单：
+     进度与结果由批量面板统一呈现，N 条 toast 会把界面刷成一片 */
+  const silent = opt.silent === true
+  const toast = silent ? () => {} : showToast
 
   const mode = opt.mode === 'replace' ? 'replace' : 'new'
   const versions = item.versions || []
@@ -2847,9 +3843,13 @@ export async function pushItemToTavern(item, opt = {}) {
     if (r?.ok) {
       item.stTargetPath = r.path || item.stTargetPath || ''
       refreshTavernCompareSoon(item)
-      showToast(`已${mode === 'replace' ? '替换' : '导入'}世界书：${item.name}`)
+      toast(
+        mode === 'replace'
+          ? `已更新世界书：${r.name || item.name}`
+          : `已在酒馆新建世界书：${r.name || item.name}`
+      )
     } else {
-      showToast('写入酒馆失败：' + ((r && r.error) || '未知错误'))
+      toast('写入酒馆失败：' + ((r && r.error) || '未知错误'))
     }
     return r || { ok: false, error: '未知错误' }
   }
@@ -2863,7 +3863,8 @@ export async function pushItemToTavern(item, opt = {}) {
     const r = await a.stImportPreset({
       tavernPath: store.settings.tavernPath,
       user: store.settings.stUser,
-      name: item.name,
+      name: presetImportName(item, version),
+      version: String(version?.version || item.stVersion || '').trim(),
       data: toPlain(content),
       engine: opt.engine || (item.stCards || [])[0]?.engine || '',
       targetPath: mode === 'replace' ? opt.targetPath || item.stTargetPath || '' : '',
@@ -2872,10 +3873,25 @@ export async function pushItemToTavern(item, opt = {}) {
     })
     if (r?.ok) {
       item.stTargetPath = r.path || item.stTargetPath || ''
+      /* 覆盖旧预设前留的备份（主进程返回原文）—— 与世界书 / 角色卡口径一致。
+         备份是附加动作，失败不影响已经成功的替换。 */
+      if (r.oldWorld && opt.backupOldWorld) {
+        try {
+          saveWorldBackup(item, r.oldWorld.name, r.oldWorld.data || r.oldWorld.text, '替换前自动备份')
+        } catch (e) {
+          console.warn('[preset backup] failed', e)
+        }
+      }
       refreshTavernCompareSoon(item)
-      showToast(`已${mode === 'replace' ? '替换' : '导入'}预设：${item.name}`)
+      /* 落点写清楚：以前只报「成功」，实际写进了酒馆不读的目录，用户看不出问题在哪 */
+      const where = r.engine ? `「${r.engine} Settings」` : ''
+      toast(
+        `已${mode === 'replace' ? '替换' : '导入'}预设：${item.name}` +
+          (where ? `，落在${where}` : '') +
+          (r.movedFrom ? '（已从旧目录改写到酒馆当前接口的目录）' : '')
+      )
     } else {
-      showToast('写入酒馆失败：' + ((r && r.error) || '未知错误'))
+      toast('写入酒馆失败：' + ((r && r.error) || '未知错误'))
     }
     return r || { ok: false, error: '未知错误' }
   }
@@ -2899,9 +3915,9 @@ export async function pushItemToTavern(item, opt = {}) {
     const r = await a.writeNamed({ dir, name: `${safeName(item.name)}.json`, text: JSON.stringify(theme, null, 2) })
     if (r?.ok) {
       item.stTargetPath = r.path || item.stTargetPath || ''
-      showToast(`已写入酒馆美化：${item.name}`)
+      toast(`已写入酒馆美化：${item.name}`)
     } else {
-      showToast('写入酒馆失败：' + ((r && r.error) || '未知错误'))
+      toast('写入酒馆失败：' + ((r && r.error) || '未知错误'))
     }
     return r || { ok: false, error: '未知错误' }
   }
@@ -2933,9 +3949,9 @@ export async function pushItemToTavern(item, opt = {}) {
       if (r.avatar) item.stAvatar = r.avatar
       refreshTavernCompareSoon(item)
       const kindText = r.mode ? '角色卡' : r.kind === 'presets' ? '预设' : '世界书'
-      showToast(`已${mode === 'replace' ? '替换' : '写入'}酒馆${kindText}：${r.name || item.name}`)
+      toast(`已${mode === 'replace' ? '替换' : '写入'}酒馆${kindText}：${r.name || item.name}`)
     } else {
-      showToast('写入酒馆失败：' + ((r && r.error) || '未知错误'))
+      toast('写入酒馆失败：' + ((r && r.error) || '未知错误'))
     }
     return r || { ok: false, error: '未知错误' }
   }
@@ -2952,6 +3968,9 @@ export async function pushItemToTavern(item, opt = {}) {
     avatar = stAvatarOf(item, opt)
   }
 
+  const wantWorld = cardWantWorld(content.json)
+  const worldSource = mode === 'new' ? await worldSourceFor(wantWorld) : undefined
+
   const payload = {
     tavernPath: store.settings.tavernPath,
     user: store.settings.stUser,
@@ -2964,13 +3983,19 @@ export async function pushItemToTavern(item, opt = {}) {
     /* 用户已经在前端点明写哪一份 → 主进程别再弹一次选择框；
        没点明（avatar 来自历史记录）时留空，让主进程弹窗兜底 */
     pickAvatar: mode === 'replace' ? String(opt.pickAvatar || '') || undefined : undefined,
-    worldName: item.worldName || ''
+    worldName: item.worldName || '',
+    /* 新建不传任何「选哪一份」的参数：主进程直接按独立基名另起一份，不判同族、不问覆盖。
+       下面这条是世界书补写用：卡内 extensions.world 指向的名，酒馆 worlds 下缺失时由主进程按这份内容补写 */
+    worldSource
   }
 
+  /* 新建 = 直接新建：主进程自己按独立基名另起一份，这里不做同族判定、不弹任何选择菜单，
+     单条与多选共用这一条路径。 */
   let r = mode === 'replace' ? await a.stReplaceCard(payload) : await a.stImportCard(payload)
   /* 酒馆里根本没有这张卡（没导入过、或被改名了）：不报错、也不弹任何窗，直接当新卡写一份。
      「更新」和「导入」在用户眼里是同一个动作 —— 有就覆盖，没有就新建。 */
   if (mode === 'replace' && r && !r.ok && r.notFound) {
+    /* 用户点的是「更新」，酒馆里没有这张卡 → 当新建写一份（同一套直接新建逻辑，不会覆盖任何卡）。 */
     r = await a.stImportCard({ ...payload, avatar: undefined, pickAvatar: undefined })
     if (r && r.ok) r.createdByUpdate = true
   }
@@ -2994,23 +4019,156 @@ export async function pushItemToTavern(item, opt = {}) {
         console.warn('[refresh compare] failed', e)
       }
     }
-    showToast(
-      r.createdByUpdate
-        ? `酒馆里还没有这张卡，已新建：${item.name}`
+    /* 提示里既给卡内真名（酒馆里显示的那个名字），也给写进去的文件名 ——
+       两个名字不一样时，用户找不到自己刚写进去的是哪一份。 */
+    const realName = cardDisplayName(content.json, item.name)
+    const where = r.avatar ? `（${r.avatar}.png）` : ''
+    const worldNote = r.worldFilled ? `，已补世界书「${r.world}」` : ''
+    toast(
+      (r.createdByUpdate
+        ? `酒馆里还没有这张卡，已新建：${realName}${where}`
         : mode === 'replace'
-          ? `已更新到酒馆：${item.name}`
-          : `已在酒馆新建：${item.name}`
+          ? `已更新：${realName}${where}`
+          : `已在酒馆新建：${realName}${where}`) + worldNote
     )
   } else if (r && r.canceled) {
-    showToast('已取消，酒馆里的角色卡没有改动')
+    toast('已取消，酒馆里的角色卡没有改动')
   } else if (r && r.needPick) {
     /* 酒馆里有多个同名副本、但这一轮没拿到用户点选（条目上的比对过期）：
        绝不能再静默写一张，提示用户到详情页点一次「更新到酒馆」由菜单定夺 */
-    showToast('酒馆里有多个同名角色，请在详情页点「更新到酒馆」选择写哪一份')
+    toast('酒馆里有多个同名角色，请在详情页点「更新到酒馆」选择写哪一份')
   } else {
-    showToast('写入酒馆失败：' + ((r && r.error) || '未知错误'))
+    toast('写入酒馆失败：' + ((r && r.error) || '未知错误'))
   }
   return r || { ok: false, error: '未知错误' }
+}
+
+/* ---------------- 批量写入酒馆（多选版本） ---------------- */
+
+/** 结果项归类文案：汇总面板直接用，避免前后端口径不一致 */
+export function tavernBatchStatusText(r) {
+  if (!r) return ''
+  if (r.status === 'created') return '新建'
+  if (r.status === 'skipped') return '跳过'
+  return '失败'
+}
+
+/**
+ * 把选中的多个版本串行写入酒馆（不并发写盘，一次只写一份）
+ *
+ * 批量只有一种行为：全部新建。
+ * 每个选中版本各写一张新卡，遇到同族自动另起独立基名，酒馆里已有的卡一张都不动、一张都不覆盖。
+ *
+ * @param {object} item 资料库条目
+ * @param {string[]} versionIds 选中的版本 id
+ * @param {{onProgress?: (p: {index:number,total:number,versionName:string,phase:string})=>void}} opt
+ * @returns {Promise<{ok:boolean,error?:string,total:number,okCount:number,failCount:number,skipCount:number,results:Array<object>}>}
+ */
+export async function pushVersionsToTavern(item, versionIds, opt = {}) {
+  const ids = (Array.isArray(versionIds) ? versionIds : []).map((x) => String(x))
+  const all = item && Array.isArray(item.versions) ? item.versions : []
+  /* 按版本列表顺序执行（界面上的顺序），不按点击顺序 —— 用户看到的就是执行顺序 */
+  const vers = all.filter((v) => v && ids.includes(String(v.id)))
+  const total = vers.length
+  const onProgress = typeof opt.onProgress === 'function' ? opt.onProgress : () => {}
+  const out = { ok: false, error: '', total, okCount: 0, failCount: 0, skipCount: 0, results: [] }
+  if (!total) return { ...out, error: '先选中要写入酒馆的版本' }
+
+  const a = api()
+  if (!a || (!a.stImportCard && !a.stImportWorld && !a.stImportPreset)) {
+    return { ...out, error: '请在桌面版里操作' }
+  }
+  if (!store.stStatus.connected) await checkStConnection()
+
+  /* 先把酒馆现状整条对比一次：写完要立刻给出「酒馆当前版本」标记，
+     也避免拿几天前的 stCards 误导结果展示 */
+  try {
+    await refreshTavernCompare(item, { full: true })
+  } catch (e) {
+    console.warn('[batch push] refresh compare failed', e)
+  }
+  const results = []
+  /* 本批已成功写入的内容指纹：同批次里内容重复的版本没有覆盖价值，直接跳过并说明 */
+  const written = new Map()
+
+  for (let i = 0; i < vers.length; i++) {
+    const v = vers[i]
+    const rec = {
+      versionId: String(v.id),
+      versionName: String(v.name || v.date || ''),
+      date: String(v.date || ''),
+      status: 'failed',
+      fileName: '',
+      avatar: '',
+      note: '',
+      error: '',
+      worldFilled: false,
+      worldName: ''
+    }
+    onProgress({ index: i + 1, total, versionName: rec.versionName, phase: 'start' })
+
+    if (!v.raw && !v.rawFile) {
+      rec.status = 'skipped'
+      rec.error = '这一版没有保存原始内容，无法写入酒馆'
+      results.push(rec)
+      continue
+    }
+    if (!v.digest) {
+      try { await ensureItemDigests(item) } catch (_) {}
+    }
+    const dg = String(v.digest || '')
+    if (dg && written.has(dg)) {
+      rec.status = 'skipped'
+      rec.error = `与本批「${written.get(dg)}」内容完全相同，已跳过`
+      results.push(rec)
+      continue
+    }
+
+    /* 唯一行为：新建。与单条完全同一条路径（mode:'new'），主进程按独立基名另起一份，
+       批量流程不弹任何选择菜单，也不会覆盖任何既有卡 */
+    let r = null
+    try {
+      r = await pushItemToTavern(item, {
+        version: v,
+        mode: 'new',
+        replaceWorld: false,
+        backupOldWorld: false,
+        silent: true
+      })
+    } catch (e) {
+      r = { ok: false, error: String((e && e.message) || e) }
+    }
+
+    if (r && r.ok) {
+      rec.status = 'created'
+      rec.avatar = String(r.avatar || '')
+      const file = String(r.file || '') || (rec.avatar ? `${rec.avatar}.png` : '')
+      rec.fileName = file.split(/[\\/]/).pop()
+      rec.worldFilled = !!r.worldFilled
+      rec.worldName = String(r.world || '')
+      if (dg) written.set(dg, rec.versionName)
+    } else if (r && r.canceled) {
+      rec.status = 'skipped'
+      rec.error = '已取消'
+    } else {
+      rec.status = 'failed'
+      rec.error = String((r && r.error) || '未知错误')
+    }
+    results.push(rec)
+  }
+
+  const okCount = results.filter((x) => x.status === 'created').length
+  const failCount = results.filter((x) => x.status === 'failed').length
+  const skipCount = results.filter((x) => x.status === 'skipped').length
+
+  /* 全部写完后统一刷新一次对比：逐条刷新会把酒馆扫描拖成 N 次 */
+  try {
+    await refreshTavernCompare(item, { full: true })
+  } catch (e) {
+    console.warn('[batch push] refresh compare failed', e)
+  }
+  onProgress({ index: total, total, versionName: '', phase: 'done' })
+  return { ok: failCount === 0, error: '', total, okCount, failCount, skipCount, results }
 }
 
 /* ---------------- 世界书备份（放进「其他」） ---------------- */
@@ -3303,10 +4461,11 @@ export function deleteVersions(item, ids) {
     } else keep.push(v)
   }
   if (!removed) return 0
-  // 删掉的若是当前版本，把最新的那版顶上
+  // 删掉的若是当前版本，把「正文最全的那版」顶上（不再无条件取第一版，避免空壳版当道）
   if (!keep.some((v) => v.current) && keep.length) {
-    keep[0].current = true
-    item.stVersion = keep[0].name
+    const best = bestVersionOf({ versions: keep }) || keep[0]
+    best.current = true
+    item.stVersion = best.name
   }
   if (!keep.length) item.stVersion = ''
   item.versions = keep
@@ -3336,6 +4495,22 @@ export function presetNameOf(item) {
   if (categoryOf(item) !== 'presets') return n
   const pv = parsePresetName(n)
   return String(pv.name || n).trim() || n
+}
+
+/**
+ * 预设导入酒馆时的落盘名：统一「名字·V版本号」（例：YU·V1.4.0）
+ * 版本号依次取：本次导入的版本对象 → 酒馆里在用的版本名 → 空（空则不加后缀）
+ */
+export function presetImportName(item, ver) {
+  const name = String(presetNameOf(item) || item?.name || '').trim() || 'untitled'
+  /* 版本号只认「数字打头」的写法：1.4.0 / v1.4.0 / 2.0-beta。
+     版本字段偶尔存的是「版本2」这类说明文字，原样拼上去会出现「名字·V版本2」。 */
+  const pick = (v) => {
+    const s = String(v == null ? '' : v).trim().replace(/^v/i, '')
+    return /^\d+(\.\d+)*([.\-_a-z].*)?$/i.test(s) ? s : ''
+  }
+  const raw = pick(ver && ver.version) || pick(ver && ver.name) || pick(item?.stVersion)
+  return raw ? `${name}·V${raw}` : name
 }
 
 /**
@@ -3434,6 +4609,60 @@ export function normalizeAllTags() {
 }
 
 /**
+ * 模型标签统一（启动时跑一次，幂等）：
+ * 历史预设的 tags 里存的是模型族名（gemini），而卡片徽标 / 详情页显示的是完整名（gemini 4）。
+ * 这里把族名标签折成完整名、清掉同键重复，并给还没有模型标签的预设补上，
+ * 让「标签数组」「模型徽标」「筛选栏」「标签编辑」四处口径完全一致。
+ * 只动 presets 的 tags 数组，不碰名字、版本与原始 JSON。
+ * @returns {number} 改动的条目数（0 表示无需改动）
+ */
+export function migrateModelTags() {
+  let changed = 0
+  for (const it of store.items.presets || []) {
+    /* 用户明确删掉过模型标签的条目不再自动补回 */
+    if (it.modelTagOff) continue
+    const model = String(presetModelOf(it) || '').trim()
+    if (!model) continue
+    const family = model.split(/\s+/)[0]
+    const modelKey = tagKeyOf(model)
+    const familyKey = tagKeyOf(family)
+    const arr = Array.isArray(it.tags) ? it.tags : []
+    const seen = new Set()
+    const next = []
+    let touched = false
+    for (const t of arr) {
+      const v = String(t == null ? '' : t).trim()
+      if (!v) {
+        touched = true
+        continue
+      }
+      /* 只折「族名」这一种标签（gemini → gemini 4）；用户自己写的其它标签原样保留 */
+      const fold = modelKey !== familyKey && tagKeyOf(v) === familyKey
+      if (fold) touched = true
+      const val = fold ? model : v
+      const key = tagKeyOf(val)
+      if (seen.has(key)) {
+        touched = true
+        continue
+      }
+      seen.add(key)
+      next.push(val)
+    }
+    /* 模型标签必须进 tags，筛选栏里才会出现「gemini 4」这一项 */
+    if (!seen.has(modelKey)) {
+      next.unshift(model)
+      touched = true
+    }
+    if (touched || next.length !== arr.length || next.some((v, i) => v !== arr[i])) {
+      it.tags = next
+      changed++
+    }
+  }
+  if (changed) saveItems()
+  return changed
+}
+
+/**
  * 导入时自动生成的标签：
  * ① 卡片 / 预设文件自带的标签词条（角色卡 v2 的 data.tags、v1 的 tags）
  * ② 预设识别到的模型名（标题、名称、文件名里认出来的，如 Gemini / Claude）
@@ -3469,9 +4698,10 @@ export function autoTagsOfRow(r) {
       p && p.name, p && p.preset_name
     ].filter(Boolean)
     const m = String(r.model || '').trim() || detectModel(names.join(' '))
-    /* 标签只取模型族名（gemini / claude / gpt），版本档位留给「模型」备注显示；
-       同一族不同版本共用同一个标签，筛选时不会碎成一堆 */
-    if (m) push(m.split(/\s+/)[0])
+    /* 标签与卡片上的模型徽标统一用同一个完整模型名（gemini 4 / claude 3.7 sonnet）：
+       以前这里只取族名（gemini），徽标却是完整名，于是同一个预设出现「gemini + gemini 4」
+       两个标签；完整名那一版因为从没进过 tags，筛选栏里根本点不到、也改不了 */
+    if (m) push(m)
   }
   return out
 }
@@ -3533,6 +4763,10 @@ export function setItemTags(item, tags) {
       seen.add(k)
       return true
     })
+  /* 用户手改标签后，模型标签在不在由他决定：
+     删掉了就记 modelTagOff，启动时的模型标签统一不再把它加回来 */
+  const mk = tagKeyOf(presetModelOf(item) || '')
+  if (mk) item.modelTagOff = !item.tags.some((t) => tagKeyOf(t) === mk)
   item.updatedAt = new Date().toISOString().slice(0, 10)
   saveItems()
   return true
@@ -3726,7 +4960,19 @@ export function mergeItems(ids, opt = {}) {
       const av = String(c.avatar || '')
       if (av && !target.stCards.some((x) => x.avatar === av)) target.stCards.push({ ...c })
     }
-    if (!target.stAvatar && avatars.length) target.stAvatar = avatars[0]
+    /* 取消「没有依据就取第一张卡」的兜底：只有来源的当前版本确实对上了某张卡才记绑定，
+       否则留空，等用户在对比区点「重新绑定」明确指定 */
+    if (!target.stAvatar && avatars.length) {
+      const sCur = (s.versions || []).find((x) => x.current)
+      const hitCur =
+        sCur &&
+        sCards.find(
+          (c) =>
+            (sCur.digest && c.digest && c.digest === sCur.digest) ||
+            (sCur.sig && c.sig && c.sig === sCur.sig)
+        )
+      if (hitCur && hitCur.avatar) target.stAvatar = hitCur.avatar
+    }
     // 目标缺的信息用来源补（图、来源路径、日期、DC 链接、简介）
     if (!target.imgId && s.imgId) target.imgId = s.imgId
     if (!target.srcPath && s.srcPath) target.srcPath = s.srcPath
@@ -3737,11 +4983,13 @@ export function mergeItems(ids, opt = {}) {
     store.items[src.tab] = (store.items[src.tab] || []).filter((x) => x.id !== s.id)
   }
 
-  // 保证有且只有一个当前版本
+  // 保证有且只有一个当前版本（没有 current 时选「正文最全的版本」，不再无条件取 versions[0]）
   const currents = target.versions.filter((v) => v.current)
-  if (!currents.length && target.versions.length) target.versions[0].current = true
-  else if (currents.length > 1) for (const v of currents.slice(1)) v.current = false
-  const cur = target.versions.find((v) => v.current) || target.versions[0]
+  if (!currents.length && target.versions.length) {
+    const best = bestVersionOf(target) || target.versions[0]
+    best.current = true
+  } else if (currents.length > 1) for (const v of currents.slice(1)) v.current = false
+  const cur = target.versions.find((v) => v.current) || bestVersionOf(target) || target.versions[0]
   if (cur) {
     target.stVersion = cur.name
     if (cur.imgId) target.imgId = cur.imgId
@@ -3812,7 +5060,7 @@ export async function exportSourceFile(item, version) {
     showToast('请在桌面版里操作')
     return { ok: false }
   }
-  const ver = version || (item.versions || []).find((v) => v.current) || (item.versions || [])[0] || null
+  const ver = version || bestVersionOf(item) || null
   const dir = await a.pickDir({ title: '导出到哪里', defaultPath: store.settings.exportDir || store.settings.backupLastDir })
   if (!dir) return { ok: false, canceled: true }
   store.settings.exportDir = dir
@@ -4266,11 +5514,17 @@ export async function probeDcTitles(urls) {
   return [...out, ...((r && r.list) || [])]
 }
 
-/** 检查更新：优先走可并发的批量抓取 */
-export async function runUpdateCheckFast(scope = 'all') {
+/**
+ * 检查更新：优先走可并发的批量抓取
+ * @param {'all'|'current'|'selected'} scope
+ * @param {{silent?: boolean}} [opt] silent=true 时不弹任何结果提示（启动自动检查用，
+ *   有更新只靠顶栏角标/条目角标这类既有非阻塞方式体现，错误一律不打扰）
+ */
+export async function runUpdateCheckFast(scope = 'all', opt = {}) {
+  const silent = opt.silent === true
   if (store.check.running) return
-  // 记住这次用的检查方式，下次点复合按钮主体时沿用
-  if (['all', 'current', 'selected'].includes(scope)) store.settings.checkScope = scope
+  // 记住这次用的检查方式，下次点复合按钮主体时沿用（启动自动检查不改用户的这个偏好）
+  if (!silent && ['all', 'current', 'selected'].includes(scope)) store.settings.checkScope = scope
   let list = []
   if (scope === 'current') list = store.items[store.tab] || []
   else if (scope === 'selected') list = selectedItems.value
@@ -4279,7 +5533,7 @@ export async function runUpdateCheckFast(scope = 'all') {
   const targets = list.filter((it) => it.dc?.url && !isBlacklisted(it))
   const skipped = list.length - targets.length
   if (!targets.length) {
-    showToast(skipped ? `没有可检查的条目，跳过 ${skipped} 条` : '当前范围内没有填了 DC 链接的条目')
+    if (!silent) showToast(skipped ? `没有可检查的条目，跳过 ${skipped} 条` : '当前范围内没有填了 DC 链接的条目')
     return
   }
   store.check = { running: true, scope, total: targets.length, done: 0, lastAt: store.check.lastAt }
@@ -4332,6 +5586,9 @@ export async function runUpdateCheckFast(scope = 'all') {
   store.check.running = false
   store.check.lastAt = nowStr()
 
+  /* 启动自动检查：一条提示都不弹，有更新靠角标体现，出错也不打扰 */
+  if (silent) return
+
   const parts = [`检查完成：${targets.length} 条，${updated} 条有更新`]
   if (baselined) parts.push(`${baselined} 条已记录基准标题`)
   if (skipped) parts.push(`跳过 ${skipped} 条`)
@@ -4348,6 +5605,45 @@ export async function runUpdateCheckFast(scope = 'all') {
     parts.push(errKeys.map((k) => `${txt[k] || k} ${errors[k]} 条`).join('，'))
   }
   showToast(parts.join('，'))
+}
+
+/* ---------------- 启动时自动检查一次 DC 更新 ---------------- */
+
+/* 模块级标记：App 卸载重挂 / 视图重建都不会让本次启动内的检查跑第二次 */
+let dcAutoCheckStarted = false
+
+/**
+ * 每次启动软件自动检查一次 DC 更新（用完即止，不做「今天查过就跳过」的缓存）。
+ * - 走的是右上角「检查更新」同一套 runUpdateCheckFast('all')，结果呈现完全一致；
+ * - silent：不弹提示、不打断，有更新只靠顶栏/条目角标这类既有非阻塞方式告知；
+ * - 未登录 / 没有 token、桥接缺失、网络异常、库为空：一律直接跳过并静默返回。
+ */
+export async function autoCheckDcUpdatesOnStart() {
+  if (dcAutoCheckStarted) return { ok: true, skipped: 'ONCE' }
+  dcAutoCheckStarted = true
+  try {
+    const a = api()
+    if (!a?.probeDcMany) return { ok: true, skipped: 'NO_BRIDGE' }
+    const list = allItems.value || []
+    if (!list.some((it) => it.dc?.url && !isBlacklisted(it))) return { ok: true, skipped: 'NO_TARGET' }
+    /* 没有登录态就别发请求：DC 读帖必须有账号 token，否则只会拿到一串 NEED_TOKEN */
+    if (a.dcTokenStatus) {
+      let has = false
+      try {
+        const t = await a.dcTokenStatus()
+        has = !!(t && t.ok && t.has)
+      } catch (_) {
+        has = false
+      }
+      if (!has) return { ok: true, skipped: 'NO_TOKEN' }
+    }
+    await runUpdateCheckFast('all', { silent: true })
+    return { ok: true }
+  } catch (e) {
+    /* 启动路径上绝不因为检查失败冒泡：静默吃掉，只留一条本地 debug 线索 */
+    try { console.debug('[dc auto check] skipped', e && e.message) } catch (_) {}
+    return { ok: false, error: String((e && e.message) || e) }
+  }
 }
 
 /* ---------------- 批量导出源文件 / 批量推到酒馆 ---------------- */
@@ -4397,7 +5693,7 @@ export async function exportSourceFiles(items) {
   let ok = 0
   const fails = []
   for (const it of list) {
-    const ver = (it.versions || []).find((v) => v.current) || (it.versions || [])[0] || null
+    const ver = bestVersionOf(it) || (it.versions || [])[0] || null
     const r = await exportOneToDir(it, ver, dir)
     if (r.ok) ok++
     else fails.push(it.name)
@@ -4418,7 +5714,7 @@ export async function batchPushNew(items, opt = {}) {
   const fails = []
   for (const it of list) {
     /* 显式挑最新版传下去：pushItemToTavern 已不允许「不传 version」，统一在这里补 */
-    const v = (it.versions || []).find((x) => x.current) || (it.versions || [])[0] || null
+    const v = bestVersionOf(it) || (it.versions || [])[0] || null
     const r = await pushItemToTavern(it, {
       mode: 'new',
       version: v,

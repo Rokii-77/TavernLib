@@ -159,12 +159,20 @@ async function injectExt() {
   if (!a?.stExtInject) return showToast('请在桌面版里使用')
   extBusy.value = true
   try {
-    const r = await a.stExtInject({ tavernPath: store.settings.tavernPath, user: store.settings.stUser })
+    /* 只有「已是最新却仍点重装」才强制重写；安装/更新交给主进程按版本比对决定 */
+    const force = !!extInfo.value.installed && !extNeedUpdate.value
+    const r = await a.stExtInject({
+      tavernPath: store.settings.tavernPath,
+      user: store.settings.stUser,
+      force
+    })
     if (!r?.ok) return showToast(r?.error || '注入失败')
     await refreshExt()
     /* 注入完顺带复查一次版本，右下角那张「需要重新注入」的卡要跟着消失 */
     Promise.resolve(checkStExtVersion()).catch(() => {})
-    showToast('已写入扩展 v' + (r.version || extInfo.value.latest || '') + '，刷新酒馆页面生效')
+    const ver = r.version || extInfo.value.latest || ''
+    if (r.skipped) showToast(r.message || '酒馆里已是 v' + ver + '，未重写')
+    else showToast((r.message || '已写入扩展 v' + ver) + '，刷新酒馆页面生效')
   } finally {
     extBusy.value = false
   }
@@ -213,6 +221,43 @@ async function openFolder(p) {
   if (r && r.ok === false) showToast('打不开：' + (r.error || '未知原因'))
 }
 
+/* 搬迁进度：主进程每复制一批文件推一次，页面上直接显示「第几个文件 / 多少 MB」 */
+const migrateStage = ref('')
+const migratePct = ref(0)
+let offMigrate = null
+function watchMigrate() {
+  migrateStage.value = '正在准备搬迁…'
+  migratePct.value = 0
+  if (offMigrate || !window.api?.onDataMigrateProgress) return
+  offMigrate = window.api.onDataMigrateProgress((p) => {
+    const total = Number(p?.total || 0) || 0
+    const done = Number(p?.done || 0) || 0
+    const mb = (Number(p?.bytes || 0) / 1048576).toFixed(1)
+    const tmb = (Number(p?.totalBytes || 0) / 1048576).toFixed(1)
+    if (p?.phase === 'start') {
+      migrateStage.value = `正在准备搬迁 ${total} 个文件（约 ${tmb} MB）…`
+      migratePct.value = 0
+    } else if (p?.phase === 'copy') {
+      migrateStage.value = `正在复制封面 / 原始内容 ${done}/${total} 个文件（${mb} / ${tmb} MB）`
+      migratePct.value = total ? Math.round((done * 100) / total) : 0
+    } else if (p?.phase === 'verify') {
+      migrateStage.value = '正在校验复制结果…'
+      migratePct.value = 100
+    } else if (p?.phase === 'done') {
+      migrateStage.value = '搬迁完成'
+      migratePct.value = 100
+    }
+  })
+}
+function unwatchMigrate() {
+  try {
+    if (offMigrate) offMigrate()
+  } catch (_) {}
+  offMigrate = null
+  migrateStage.value = ''
+  migratePct.value = 0
+}
+
 async function changeDataDir() {
   const a = window.api
   if (!a?.dataSetDir) return showToast('请在桌面版里使用')
@@ -220,18 +265,24 @@ async function changeDataDir() {
   if (!dir) return
   if (dir === dataDir.value) return showToast('就是这个目录')
   const ok = window.confirm(
-    `把软件数据换到：\n${dir}\n\n资料库条目、设置、Discord 凭据都会一起搬过去，重启管理器后生效。继续？`
+    `把软件数据换到：\n${dir}\n\n资料库条目、设置、Discord 凭据，以及封面图 / 原始内容 / 缩略图缓存会整库搬过去。\n` +
+      `库里东西多时这一步要几分钟，期间别关软件。重启管理器后生效。继续？`
   )
   if (!ok) return
   dataBusy.value = true
+  watchMigrate()
   try {
     await flushSnapshot()
     const r = await a.dataSetDir({ dir, migrate: true })
     if (!r?.ok) return showToast('切换失败：' + (r?.error || '未知原因'))
     dataDir.value = r.dir || dir
     dataCustom.value = true
-    showToast('已切换数据位置，重启管理器后生效')
+    const m = r.migrate || {}
+    const size = ((Number(m.bytes) || 0) / 1048576).toFixed(1)
+    const detail = m.files ? `（已搬 ${m.files} 个文件 / ${size} MB，封面与原始内容都在）` : ''
+    showToast('已切换数据位置' + detail + '，重启管理器后生效')
   } finally {
+    unwatchMigrate()
     dataBusy.value = false
   }
 }
@@ -239,17 +290,24 @@ async function changeDataDir() {
 async function resetDataDir() {
   const a = window.api
   if (!a?.dataSetDir) return showToast('请在桌面版里使用')
-  const ok = window.confirm(`数据位置恢复为默认：\n${dataDefault.value}\n\n重启管理器后生效。继续？`)
+  const ok = window.confirm(
+    `数据位置恢复为默认：\n${dataDefault.value}\n\n` +
+      `封面图 / 原始内容 / 缩略图缓存会一起搬回默认目录（否则重启后打开就是空白库）。\n重启管理器后生效。继续？`
+  )
   if (!ok) return
   dataBusy.value = true
+  watchMigrate()
   try {
     await flushSnapshot()
-    const r = await a.dataSetDir({ dir: '', migrate: false })
+    const r = await a.dataSetDir({ dir: '', migrate: true })
     if (!r?.ok) return showToast('恢复失败：' + (r?.error || '未知原因'))
     dataDir.value = r.dir || dataDefault.value
     dataCustom.value = false
-    showToast('已恢复默认数据位置，重启管理器后生效')
+    const m = r.migrate || {}
+    const detail = m.files ? `（已搬回 ${m.files} 个文件）` : ''
+    showToast('已恢复默认数据位置' + detail + '，重启管理器后生效')
   } finally {
+    unwatchMigrate()
     dataBusy.value = false
   }
 }
@@ -308,26 +366,46 @@ async function checkUpdate() {
     })
     updResult.value = r
     /* 手动检查的结果也同步给右下角弹窗，两边看到的是同一个版本 */
-    if (r && r.ok && r.hasUpdate) {
-      store.appUpdate = {
-        ...store.appUpdate,
+    /* 链路 / 校验 / 失败原因一起同步：失败时也写，避免把「限流」显示成「已是最新」 */
+    if (r) {
+      const meta = {
         lastAt: new Date().toISOString(),
-        hasUpdate: true,
-        latest: r.latest || '',
         current: r.current || appVersion.value,
-        notes: r.notes || '',
-        url: r.url || '',
-        downloadUrl: r.downloadUrl || '',
-        downloadName: r.downloadName || '',
-        downloadDigest: r.downloadDigest || '',
-        downloadSize: Number(r.downloadSize || 0),
-        ignored: String(store.settings.ignoredUpdateVersion || '').trim() === String(r.latest || '').trim()
+        channel: r.channel || '',
+        channelLabel: r.channelLabel || '',
+        verify: r.verify || '',
+        verifyLabel: r.verifyLabel || '',
+        manifest: !!r.manifest,
+        manifestNote: r.manifestNote || '',
+        kind: r.kind || '',
+        error: r.ok === false ? r.error || '' : '',
+        hint: r.hint || ''
+      }
+      if (r.ok && r.hasUpdate) {
+        store.appUpdate = {
+          ...store.appUpdate,
+          ...meta,
+          hasUpdate: true,
+          latest: r.latest || '',
+          notes: r.notes || '',
+          url: r.url || '',
+          downloadUrl: r.downloadUrl || '',
+          downloadName: r.downloadName || '',
+          downloadDigest: r.downloadDigest || '',
+          downloadSize: Number(r.downloadSize || 0),
+          ignored: String(store.settings.ignoredUpdateVersion || '').trim() === String(r.latest || '').trim()
+        }
+      } else {
+        store.appUpdate = { ...store.appUpdate, ...meta }
       }
     }
-    if (!r.configured) showToast('尚未配置更新源')
-    else if (!r.ok) showToast('检查失败：' + (r.error || '未知原因'))
-    else if (r.hasUpdate) showToast(`发现新版本 v${r.latest}`)
-    else showToast('已是最新版本')
+    if (!r) showToast('检查失败：没有拿到结果')
+    else if (!r.configured) showToast('尚未配置更新源')
+    else if (!r.ok) {
+      showToast(r.kind === 'ratelimit' ? 'GitHub 限流：稍后重试或换网络' : '检查失败：' + (r.error || '未知原因'))
+    } else if (r.hasUpdate) {
+      showToast(`发现新版本 v${r.latest}` + (r.verify === 'sha256' ? '' : '（校验已降级）'))
+    } else showToast('已是最新版本')
   } finally {
     updBusy.value = false
   }
@@ -349,6 +427,24 @@ async function openDownload() {
 const updNotes = computed(() => {
   const t = String(updResult.value?.notes || '').trim()
   return t.length > 1200 ? t.slice(0, 1200) + '…' : t
+})
+
+/* 检查失败按类型给标题：限流 / 网络不可达 / 没有 Release，其余归为未知失败 */
+const updErrTitle = computed(() => {
+  const k = String(updResult.value?.kind || '')
+  if (k === 'ratelimit') return 'GitHub 接口限流'
+  if (k === 'network') return '网络不可达'
+  if (k === 'no-release') return '仓库还没有发布 Release'
+  return '检查失败'
+})
+
+/* 启动自动检查留在 store 里的失败原因，同样按类型给标题 */
+const autoErrTitle = computed(() => {
+  const k = String(store.appUpdate.kind || '')
+  if (k === 'ratelimit') return '上次自动检查被 GitHub 限流'
+  if (k === 'network') return '上次自动检查连不上 GitHub'
+  if (k === 'no-release') return '仓库还没有发布 Release'
+  return '上次自动检查失败'
 })
 
 /* ---------- 下载 / 安装进度：直接读 store.upd，和右下角弹窗共用一份 ---------- */
@@ -378,6 +474,8 @@ async function downloadUpdate() {
       downloadName: r.downloadName || '',
       downloadDigest: r.downloadDigest || '',
       downloadSize: Number(r.downloadSize || 0),
+      verify: r.verify || store.appUpdate.verify || '',
+      verifyLabel: r.verifyLabel || store.appUpdate.verifyLabel || '',
       notes: r.notes || '',
       ignored: false
     }
@@ -615,6 +713,22 @@ async function browsePath(key) {
               <button v-if="dataCustom" class="ghost" :disabled="dataBusy" @click="resetDataDir">恢复默认</button>
             </div>
           </div>
+          <div v-if="dataBusy && migrateStage" class="row">
+            <span>搬迁进度</span>
+            <div class="field">
+              <div class="migrate-bar"><i :style="{ width: migratePct + '%' }"></i></div>
+              <div class="migrate-tip">{{ migrateStage }}</div>
+            </div>
+          </div>
+          <div v-else class="row">
+            <span></span>
+            <div class="field">
+              <div class="migrate-tip">
+                换位置会把条目、设置、Discord 凭据连同封面图 / 原始内容 / 缩略图一起搬走；
+                中断或失败时数据位置保持不变，仍用原目录。
+              </div>
+            </div>
+          </div>
         </section>
 
         <section data-guide="set-scan">
@@ -722,16 +836,35 @@ async function browsePath(key) {
               </button>
             </span>
           </div>
+          <!-- 启动时自动检查失败（限流 / 断网 / 无 Release）也在这里露出来，不让它悄悄变成「已是最新」 -->
+          <div v-if="!updResult && store.appUpdate.error" class="upd-box">
+            <p class="upd-line warn"><b>{{ autoErrTitle }}</b></p>
+            <p class="upd-line warn">{{ store.appUpdate.error }}</p>
+            <p v-if="store.appUpdate.hint" class="upd-line dim">{{ store.appUpdate.hint }}</p>
+          </div>
           <div v-if="updResult" class="upd-box">
             <p v-if="!updResult.configured" class="upd-line warn">
               {{ updResult.error }}<template v-if="updResult.hint">：{{ updResult.hint }}</template>
             </p>
-            <p v-else-if="!updResult.ok" class="upd-line warn">检查失败：{{ updResult.error }}</p>
+            <template v-else-if="!updResult.ok">
+              <p class="upd-line warn"><b>{{ updErrTitle }}</b></p>
+              <p class="upd-line warn">{{ updResult.error }}</p>
+              <p v-if="updResult.hint" class="upd-line dim">{{ updResult.hint }}</p>
+              <p v-if="updResult.tried && updResult.tried.length" class="upd-line dim">
+                已尝试通道：{{ (updResult.tried || []).map((x) => x.channel).join(' → ') }}
+              </p>
+            </template>
             <template v-else-if="updResult.hasUpdate">
               <p class="upd-line ok">有新版本 v{{ updResult.latest }}</p>
               <p v-if="updResult.publishedAt" class="upd-line dim">发布时间：{{ updResult.publishedAt.slice(0, 10) }}</p>
               <pre v-if="updNotes" class="upd-notes">{{ updNotes }}</pre>
               <p v-else class="upd-line dim">这条 Release 没写更新说明</p>
+              <p class="upd-line dim">
+                检查通道：{{ updResult.channelLabel || '—' }} · 校验方式：{{ updResult.verifyLabel || '—' }}
+              </p>
+              <p v-if="!updResult.manifest" class="upd-line dim">
+                更新清单不可用（{{ updResult.manifestNote || '未取到' }}），本次按文件大小校验，不因此拒绝更新
+              </p>
               <p v-if="updResult.downloadName" class="upd-line dim">下载文件：{{ updResult.downloadName }}</p>
               <div v-if="upPhase === 'downloading'" class="upd-progress">
                 <div class="bar"><i :style="{ width: upPercent + '%' }"></i></div>
@@ -743,7 +876,10 @@ async function browsePath(key) {
               <p v-else-if="upPhase === 'installing'" class="upd-line ok">正在退出并安装，完成后会自动重启…</p>
               <p v-if="upError" class="upd-line warn">下载/安装失败：{{ upError }}</p>
             </template>
-            <p v-else class="upd-line ok">已是最新版本 {{ updResult.current }}</p>
+            <template v-else>
+              <p class="upd-line ok">已是最新版本 {{ updResult.current }}</p>
+              <p v-if="updResult.channelLabel" class="upd-line dim">检查通道：{{ updResult.channelLabel }}</p>
+            </template>
           </div>
         </section>
 
@@ -834,7 +970,7 @@ async function browsePath(key) {
       </div>
 
       <footer>
-        <span class="state">洛书匣 v1.0.0 · 改动前建议先做一次整库备份</span>
+        <span class="state">测试版 · 请注意保留备份</span>
         <div class="btns">
           <button @click="close">取消</button>
           <button class="primary" @click="save">保存</button>
@@ -971,6 +1107,23 @@ input[type='checkbox'] { width: 15px; height: 15px; accent-color: #d4a24c; }
   background: linear-gradient(180deg, var(--accent-2), var(--accent));
 }
 .pathval.seg .dimtext { font-size: 11px; color: var(--muted); }
+
+/* 换数据位置时的搬迁进度条 */
+.migrate-bar {
+  width: 100%;
+  height: 6px;
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--line-soft);
+}
+.migrate-bar i {
+  display: block;
+  height: 100%;
+  border-radius: 4px;
+  background: linear-gradient(180deg, var(--accent-2), var(--accent));
+  transition: width 0.2s ease;
+}
+.migrate-tip { font-size: 11px; line-height: 1.6; color: var(--muted); margin-top: 6px; }
 
 .css-box { flex: 1; display: flex; flex-direction: column; gap: 8px; }
 .link-box { flex: 1; display: flex; flex-direction: column; gap: 6px; }

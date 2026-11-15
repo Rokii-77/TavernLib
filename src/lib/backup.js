@@ -1,6 +1,7 @@
 import JSZip from 'jszip'
-import { store } from '../store.js'
+import { store, ensureVersionRaw } from '../store.js'
 import { imageBytes, extOfMime } from './images.js'
+import { cardFromPngBuffer, isThinCharacterPayload, pickRicherPayload } from './importer.js'
 
 /* 完整备份 / 导出 ZIP
    结构：
@@ -48,9 +49,62 @@ function stamp() {
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`
 }
 
-/** 优先用导入时保留的原始 JSON；没有则按条目元数据合成一份最小卡（带分类标记） */
-function payloadOf(it, v) {
-  if (v && v.raw && typeof v.raw === 'object') return v.raw
+/** 版本图片的二进制：优先版本自己的 imgId（<数据目录>/images/<imgId>.bin），其次当前版本 / 条目图 */
+async function bytesOfVersionImage(it, v) {
+  const h = (v && v.imgId) || (it.versions || []).find((x) => x.current)?.imgId || it.imgId || ''
+  if (!h) return null
+  try {
+    const r = await imageBytes(h)
+    if (r && r.bytes && r.bytes.length) return r.bytes
+  } catch (_) {}
+  return null
+}
+
+/** 从版本图片里解析内嵌角色卡：洛书匣 / 酒馆导出的卡图本身就是完整卡（chara / ccv3） */
+async function cardOfVersionImage(it, v) {
+  const bytes = await bytesOfVersionImage(it, v)
+  if (!bytes || !bytes.length) return null
+  try {
+    return cardFromPngBuffer(bytes)
+  } catch (_) {
+    return null
+  }
+}
+
+/**
+ * 取某个版本的 payload（导出用）。
+ * 兜底链（顺序不能变，缺一环就会退回「丢开场白」的老问题）：
+ *   ① 原始 JSON —— 落盘时被剥进侧车（rawFile），这里先 await ensureVersionRaw 读回来；
+ *   ② 原始 JSON 缺失、或是剥掉正文的精简卡 → 从版本图片里解析内嵌完整卡；
+ *   ③ 两者都拿不到才合成最小卡，并打「元数据缺失」标记，让导入侧知道这不是完整卡。
+ */
+async function payloadOf(it, v) {
+  const p = await payloadOfInner(it, v)
+  /* 条目名单独记一份：卡里的 data.name（如「方亦楷2.0」）常与库内条目名（「方亦楷」）不一致，
+     导入时按卡名建条目会把一条拆成两条。带上这个字段，导入侧就能还原原始条目名。 */
+  if (!p || typeof p !== 'object' || p.tavernlib_item_name) return p
+  try {
+    return { ...p, tavernlib_item_name: it.name || '' }
+  } catch (_) {
+    return p
+  }
+}
+
+async function payloadOfInner(it, v) {
+  let raw = null
+  try {
+    raw = await ensureVersionRaw(it, v)
+  } catch (_) {
+    raw = null
+  }
+  if (!raw || typeof raw !== 'object') raw = null
+  /* 精简元数据卡（没有 first_mes / description）不算「拿到正文」，继续往下走图片兜底 */
+  if (raw && (it.category !== 'characters' || !isThinCharacterPayload(raw))) return raw
+
+  const fromImg = await cardOfVersionImage(it, v)
+  if (fromImg) return pickRicherPayload(it.category, raw, fromImg) || fromImg
+  if (raw) return raw
+
   const data = {
     name: it.name,
     description: it.desc || '',
@@ -61,9 +115,16 @@ function payloadOf(it, v) {
     updated_at: it.updatedAt || ''
   }
   if (it.category === 'characters') {
-    return { spec: 'chara_card_v2', spec_version: '2.0', tavernlib_category: 'characters', data }
+    return {
+      spec: 'chara_card_v2',
+      spec_version: '2.0',
+      tavernlib_category: 'characters',
+      /* 正文确实丢了（既没原始 JSON 也没有可解析的卡图）：显式标记，导入侧据此提示而不是静默降级 */
+      tavernlib_meta_only: true,
+      data
+    }
   }
-  return { tavernlib_category: it.category || 'others', name: it.name, data }
+  return { tavernlib_category: it.category || 'others', tavernlib_meta_only: true, name: it.name, data }
 }
 
 function dataUrlToBase64(cover) {
@@ -129,12 +190,12 @@ export async function buildBackupZip(itemsByCat, opts = {}) {
       const cur = versions.find((v) => v.current) || versions[0]
       const dir = folder.folder(safeName(it.name))
       const imgIndex = { cover: '', versions: {} }
-      // 当前版本
-      dir.file(`${safeName(cur.name || 'v1')}.json`, JSON.stringify(payloadOf(it, cur), null, 2))
+      // 当前版本（payload 可能是异步读回的：先等 raw 侧车 / 图片内嵌卡兜底，绝不写精简空壳）
+      dir.file(`${safeName(cur.name || 'v1')}.json`, JSON.stringify(await payloadOf(it, cur), null, 2))
       // 历史版本
       for (const v of versions) {
         if (v === cur) continue
-        dir.file(`history/${safeName(v.name || 'v')}.json`, JSON.stringify(payloadOf(it, v), null, 2))
+        dir.file(`history/${safeName(v.name || 'v')}.json`, JSON.stringify(await payloadOf(it, v), null, 2))
       }
       // 版本图片：按内容哈希命名，同图只打包一份
       for (const v of versions) {

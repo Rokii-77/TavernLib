@@ -1,6 +1,7 @@
 ﻿<script setup>
 import { computed, nextTick, onMounted, onUnmounted, ref, watch, onBeforeUnmount, markRaw } from 'vue'
 import TavernPreview from '../components/TavernPreview.vue'
+import RichText from '../components/RichText.vue'
 import {
   store,
   closeDetail,
@@ -14,6 +15,8 @@ import {
   setDcTitle,
   addNewVersionFromFile,
   pushItemToTavern,
+  pushVersionsToTavern,
+  tavernBatchStatusText,
   refreshTavernCompare,
   exportSourceFile,
   listWorldBackups,
@@ -35,26 +38,39 @@ import {
   presetModelOf,
   loadThemeDoc,
   tagKeyOf,
-  withTavernTarget
+  withTavernTarget,
+  bindTavernCard,
+  stByText,
+  ensureVersionRaw
 } from '../store.js'
 import { createTapHandler } from '../lib/tap.js'
 import { ensureImage, saveImageDataUrl, urlOf } from '../lib/images.js'
+import { GREET_RAW, greetRawNeedOf, preloadGreetRaw, greetingViewOf } from '../lib/greetingView.js'
 
 const props = defineProps({ item: { type: Object, required: true } })
 
-/** 标签只在「预设」分类可用：其它分类即使老数据里带了 tags 也不展示（数据保留不动） */
+/**
+ * 详情页标签：模型标签与自定义标签在同一套逻辑、同一个容器里输出。
+ * 以前模型名单独挂在「模型」事实行、自定义标签挂在名字下方的 chips 里，
+ * 同一个模型标签看起来像两套东西；现在模型标签排在最前，其余标签依次跟在后面，
+ * 都走同一套去重（tagKeyOf 忽略大小写与空白）。
+ * 用户在「编辑标签」里删掉模型标签后（item.modelTagOff），不再强行加回来。
+ */
 const itemTags = computed(() => {
   if (catOf(props.item) !== 'presets') return []
   const seen = new Set()
   const out = []
-  /* 预设上面已经有「模型」一项了，标签里再出现同一个模型名就等于显示两遍 */
-  const modelKey = tagKeyOf(presetModelOf(props.item) || '')
+  const model = String(presetModelOf(props.item) || '').trim()
+  const modelKey = model ? tagKeyOf(model) : ''
+  if (model && modelKey && !props.item.modelTagOff) {
+    seen.add(modelKey)
+    out.push(model)
+  }
   for (const t of props.item.tags || []) {
     const v = String(t == null ? '' : t).trim()
     if (!v) continue
     const k = tagKeyOf(v)
     if (!k || seen.has(k)) continue
-    if (modelKey && k === modelKey) continue
     seen.add(k)
     out.push(v)
   }
@@ -84,10 +100,13 @@ const backupOldWorld = ref(false)
 const wbOpen = ref(false)
 const wbList = ref([])
 
+/* 无封面时的占位渐变：明度走 --cover-l1/--cover-l2，日间自动变浅，不再是一块深色 */
 const coverStyle = computed(() => {
   const h = props.item.hue ?? 30
   return {
-    background: `linear-gradient(155deg, hsl(${h} 46% 34%), hsl(${(h + 24) % 360} 38% 16%) 70%, #12151a)`
+    background:
+      `linear-gradient(155deg, hsl(${h} 46% var(--cover-l1, 34%)), ` +
+      `hsl(${(h + 24) % 360} 38% var(--cover-l2, 16%)) 70%, var(--cover-ink, #12151a))`
   }
 })
 
@@ -331,16 +350,65 @@ const themeCssLines = computed(() => (themeCss.value ? themeCss.value.split(/\r?
    src/lib/tavernPreview.js，这里只负责取数据并交给 <TavernPreview> 渲染 */
 
 
-/** 版本 id → 与之内容一致的那张酒馆卡 */
+/** 版本 id → 与之内容一致的那张酒馆卡（同内容多卡时全留着，不能互相覆盖） */
 const stMatch = computed(() => {
   const map = {}
   for (const c of props.item.stCards || []) {
-    if (c.matchVersionId) map[c.matchVersionId] = c
+    if (!c.matchVersionId) continue
+    if (!map[c.matchVersionId]) map[c.matchVersionId] = []
+    map[c.matchVersionId].push(c)
   }
   return map
 })
 
 const stCardCount = computed(() => (props.item.stCards || []).length)
+/** 不同角色名个数：同名多份副本算一张卡、一个名字 */
+const stNameCount = computed(() => {
+  const set = new Set()
+  for (const c of props.item.stCards || []) set.add(String(c.name || c.avatar || ''))
+  return set.size
+})
+
+/** 来源标记：内容指纹 / 卡内真名 / 已登记绑定 / 未匹配（文案与选卡菜单同源） */
+const stByLabel = stByText
+
+/** 当前绑定的是哪一张卡 */
+const stBound = computed(() => {
+  const av = String(props.item.stAvatar || '')
+  if (!av) return null
+  return (props.item.stCards || []).find((c) => c.avatar === av) || null
+})
+
+/** 绑定存在但内容与任何版本都不一致 → 给出重新绑定入口 */
+const stNeedRebind = computed(() => {
+  if (!isCharacter.value) return false
+  const b = stBound.value
+  return !!b && b.by !== 'content'
+})
+
+/** 手动改绑：只写资料库自己的绑定字段，不动酒馆里的任何文件 */
+function rebind(e) {
+  const cards = props.item.stCards || []
+  if (!cards.length) return
+  const items = cards.map((c) => ({
+    label: `${c.name || c.avatar}`,
+    desc: c.file || `${c.avatar}.png`,
+    hint: stByLabel(c),
+    action: () => {
+      bindTavernCard(props.item, c.avatar)
+      showToast(`已绑定：${c.name || c.avatar}（${c.file || c.avatar + '.png'}）`)
+    }
+  }))
+  items.push({ divider: true })
+  items.push({
+    label: '解除绑定',
+    action: () => {
+      bindTavernCard(props.item, '')
+      showToast('已解除绑定')
+    }
+  })
+  openMenu(e, items)
+}
 
 /* ---------- 酒馆里的当前版本（按酒馆实际文件内容与资料库版本比对得出） ---------- */
 const tavernCur = computed(() => tavernCurrentVersion(props.item))
@@ -378,13 +446,53 @@ watch(
 )
 onMounted(() => primeCovers([props.item]))
 
-/* ---------- 开场白（与酒馆一致：1 条默认 + N 条备选） ---------- */
-const greets = computed(() => greetingsOfVersion(activeVersion.value))
+/* ---------- 开场白（与酒馆一致：1 条默认 + N 条备选） ----------
+ * 坑：版本的 raw 落盘时被剥成侧车文件（version.rawFile），重启后 version.raw 是 undefined，
+ * 而详情页从不调 ensureVersionRaw，于是「还没读回来」和「确实没有默认开场白」被判成了同一种空，
+ * 数据完好的卡（159 张）也一律显示「这一版没有默认开场白」。
+ * 现在按三态走：raw 未就绪 → 加载态；读回来为空 → 空提示；有值 → 正常渲染。
+ */
+function createGreetRawLoader(getVersion) {
+  const state = ref(GREET_RAW.READY)
+  let seq = 0
+  async function load() {
+    const v = getVersion()
+    const mine = ++seq
+    const need = greetRawNeedOf(v)
+    if (need !== 'read') {
+      state.value = need
+      return
+    }
+    state.value = GREET_RAW.LOADING
+    // store 内按侧车文件名做了并发去重，详情页与弹层不会重复读同一份侧车
+    const res = await preloadGreetRaw({ version: v, ensureRaw: () => ensureVersionRaw(props.item, v) })
+    if (mine !== seq) return // 期间切了版本 / 换了条目，丢掉这次结果
+    state.value = res
+  }
+  return { state, load }
+}
+
+const activeGreetRaw = createGreetRawLoader(() => activeVersion.value)
+const greets = computed(() =>
+  greetingViewOf({ greets: greetingsOfVersion(activeVersion.value), rawState: activeGreetRaw.state.value })
+)
+/* 打开详情页、点历史版本切换、条目本身变化，都重新预载一次 */
+watch([activeVersion, () => props.item.id], () => activeGreetRaw.load(), { immediate: true })
+
 const greetOpen = ref(false)
 const greetVersion = ref(null)
 const greetIndex = ref(0)
+/* 弹层里的版本同样要预载：双击一个还没切过去的版本，它的 raw 也可能是 undefined */
+const modalGreetRaw = createGreetRawLoader(() => greetVersion.value)
+const greetView = computed(() =>
+  greetingViewOf({ greets: greetingsOfVersion(greetVersion.value), rawState: modalGreetRaw.state.value })
+)
+watch([greetVersion, greetOpen], ([, open]) => {
+  if (open) modalGreetRaw.load()
+})
+
 const greetAll = computed(() => {
-  const g = greetingsOfVersion(greetVersion.value)
+  const g = greetView.value
   const list = []
   if (g.first) list.push({ kind: '默认开场白', text: g.first })
   g.alternates.forEach((t, i) => list.push({ kind: `其他开场白 ${i + 1}/${g.alternates.length}`, text: t }))
@@ -453,6 +561,7 @@ function openGreet(v) {
   greetIndex.value = 0
   greetDrag.value = { x: 0, y: 0, on: false }
   greetOpen.value = true
+  modalGreetRaw.load() // 先同步把状态切成加载态/就绪，避免弹层先闪一帧「没有开场白」
 }
 function closeGreet() {
   endGreetDrag()
@@ -561,6 +670,71 @@ function delVersions(ids, tip = '') {
   refreshTavernCompare(props.item)
 }
 
+/* ---------- 批量新建到酒馆（复用版本列表的勾选机制，只有「新建」一种行为） ---------- */
+const bpOpen = ref(false)
+const bpStep = ref('run') // run 串行写入 → done 结果汇总
+const bpBusy = ref(false)
+const bpProgress = ref({ index: 0, total: 0, versionName: '' })
+const bpResult = ref(null)
+/** 写入中：进度条按「已处理 / 总数」推进 */
+const bpPercent = computed(() => {
+  const t = bpProgress.value.total || 0
+  if (!t) return 0
+  return Math.min(100, Math.round((bpProgress.value.index / t) * 100))
+})
+const bpCreated = computed(() => (bpResult.value?.results || []).filter((r) => r.status === 'created').length)
+
+/** 点一下就直接写：不弹策略菜单，语义固定为「全部新建」（同族自动另起基名，绝不覆盖既有卡） */
+function openBatchPush() {
+  if (bpBusy.value) return
+  if (!pickedVersionIds.value.length) return showToast('先勾选要新建到酒馆的版本')
+  runBatchPush()
+}
+
+function closeBatchPush() {
+  if (bpStep.value === 'run') return /* 正在写盘，不允许中途关窗 */
+  bpOpen.value = false
+  bpStep.value = 'run'
+}
+
+async function runBatchPush() {
+  if (bpBusy.value) return
+  const ids = pickedVersionIds.value.slice()
+  if (!ids.length) return showToast('先勾选要新建到酒馆的版本')
+  bpBusy.value = true
+  bpResult.value = null
+  bpStep.value = 'run'
+  bpProgress.value = { index: 0, total: ids.length, versionName: '' }
+  bpOpen.value = true
+  let res = null
+  try {
+    res = await pushVersionsToTavern(props.item, ids, {
+      onProgress: (p) => {
+        bpProgress.value = { index: p.index, total: p.total, versionName: p.versionName || '' }
+      }
+    })
+  } catch (e) {
+    res = {
+      ok: false,
+      error: String((e && e.message) || e),
+      results: [],
+      okCount: 0,
+      failCount: ids.length,
+      skipCount: 0,
+      total: ids.length
+    }
+  }
+  bpResult.value = res || { ok: false, error: '未知错误', results: [], okCount: 0, failCount: 0, skipCount: 0 }
+  bpStep.value = 'done'
+  bpBusy.value = false
+  /* 写完后自动对比刷新：由 store 内部的批量写入口统一触发一次，
+     这里只做一次兜底，保证「酒馆当前版本」标记跟着新写入的文件立即更新 */
+  refreshTavernCompare(props.item)
+  const rr = bpResult.value
+  if (rr.ok === false && rr.error) showToast(rr.error)
+  else showToast(`已新建 ${rr.okCount || 0} 张，跳过 ${rr.skipCount || 0} 项，失败 ${rr.failCount || 0} 项`)
+}
+
 /* ---------- 链接更新版本 ---------- */
 const linkOpen = ref(false)
 const linkVal = ref('')
@@ -646,7 +820,8 @@ async function refreshSt() {
 }
 
 function newToTavern(e, version) {
-  /* 「新建到酒馆」：不去匹配已有卡，直接把这个指定版本作为新的一份写进酒馆 */
+  /* 「新建到酒馆」= 直接新建：不匹配已有卡、不问覆盖哪一份，同族/同名时由主进程自动另起独立基名，
+     落盘文件名由 toast 里的 (X.png) 明确告知 */
   return pushItemToTavern(props.item, { mode: 'new', version })
     .then((r) => {
       if (r && r.ok === false) showToast('失败：' + (r.error || '未知错误'))
@@ -768,7 +943,11 @@ function versionMenu(e, v) {
   const total = (props.item.versions || []).length
   openMenu(e, [
     { label: '更新到酒馆', action: () => updateToTavern(e, v) },
-    { label: '新建到酒馆', action: () => newToTavern(e, v) },
+    {
+      label: '新建到酒馆',
+      hint: '同名自动另起基名',
+      action: () => newToTavern(e, v)
+    },
     { divider: true },
     { label: '导出源文件', action: () => exportSourceFile(props.item, v) },
     { divider: true },
@@ -795,6 +974,7 @@ function headerMenu(e) {
     { label: '更新到酒馆', action: () => updateToTavernByLatest() },
     {
       label: '新建到酒馆',
+      hint: '同名自动另起基名',
       action: () => {
         const v = currentVersion.value
         if (!v) return showToast('这个条目还没有任何版本')
@@ -900,13 +1080,20 @@ function refreshSort() {
         <div v-if="isCharacter" class="block">
           <div class="block-title">
             开场白
-            <span v-if="greets.total" class="block-sub">默认 1 条<template v-if="greets.alternates.length">｜其他 {{ greets.alternates.length }} 条</template></span>
+            <span v-if="greets.subText" class="block-sub">{{ greets.subText }}</span>
           </div>
-          <div v-if="!greets.first" class="block-body empty">这一版没有默认开场白</div>
+          <!-- 三态：raw 预载中给加载态；读回来确实为空才说没有；有备选的说清有几条 -->
+          <div v-if="greets.state === 'loading'" class="block-body empty greet-loading">
+            <span class="greet-spin"></span>正在读取这一版的开场白…
+          </div>
+          <div v-else-if="greets.state === 'unreadable'" class="block-body empty greet-warn">
+            {{ greets.message }}
+          </div>
+          <div v-else-if="greets.state !== 'ok'" class="block-body empty">{{ greets.message }}</div>
           <div v-else class="opening-list">
             <div class="opening">
               <span class="op-idx"></span>
-              <span class="op-text">{{ greets.first }}</span>
+              <RichText class="op-text" :text="greets.first" src-font-size="12px" />
             </div>
           </div>
           <button v-if="greets.alternates.length" class="op-toggle" @click="openGreet(activeVersion)">
@@ -920,7 +1107,10 @@ function refreshSort() {
           <div v-if="isPreset" class="fact"><span>模型</span><b>{{ presetModel || '—' }}</b></div>
           <div class="fact"><span>版本数量</span><b>{{ (item.versions || []).length }}</b></div>
           <div class="fact"><span>日期</span><b>{{ item.date || item.updatedAt }}</b></div>
-          <div class="fact"><span>酒馆里的同名{{ unit }}</span><b>{{ stCardCount }} 个</b></div>
+          <div class="fact">
+            <span>酒馆里的同名{{ unit }}</span>
+            <b>{{ stCardCount }} 张<template v-if="isCharacter && stNameCount > 1"> / {{ stNameCount }} 个角色名</template></b>
+          </div>
         </div>
       </aside>
 
@@ -1026,18 +1216,26 @@ function refreshSort() {
               <span class="st-text">
                 酒馆{{ store.stStatus.connected ? '已连接' : '未连接' }}
                 <template v-if="stCardCount">
-                  ｜有 {{ stCardCount }} 个同名{{ unit }}<template v-if="item.stCheckedAt">，比对于 {{ item.stCheckedAt }}</template>
+                  ｜有 {{ stCardCount }} 张同名{{ unit }}<template v-if="isCharacter && stNameCount > 1">（{{ stNameCount }} 个角色名）</template><template v-if="item.stCheckedAt">，比对于 {{ item.stCheckedAt }}</template>
                 </template>
                 <template v-else>｜还没有这个{{ unit }}</template>
               </span>
               <button class="mini ghost" :disabled="stBusy" @click="refreshSt">重新对比</button>
+              <button v-if="stNeedRebind" class="mini ghost" @click.stop="rebind">重新绑定</button>
             </div>
+
+            <div v-if="item.stError" class="st-warn">{{ item.stError }}</div>
 
             <div class="st-cards" v-if="stCardCount">
               <div v-for="c in item.stCards" :key="c.avatar" class="st-card">
-                <span class="c-name">{{ isCharacter ? c.avatar : c.name }}</span>
+                <span class="c-name">
+                  {{ c.name || c.avatar }}
+                  <em v-if="isCharacter && item.stAvatar === c.avatar" class="bound-tag">已绑定</em>
+                </span>
+                <span v-if="isCharacter && c.file && c.file !== (c.name || c.avatar) + '.png'" class="c-file">{{ c.file }}</span>
                 <span class="chip" :class="c.same ? 'ok' : ''">
                   {{ c.same ? '与「' + c.matchVersionName + '」一致' : '与任何版本都不一致' }}
+                  <em class="by-tag">{{ stByLabel(c) }}</em>
                 </span>
               </div>
             </div>
@@ -1162,11 +1360,72 @@ function refreshSort() {
           <div class="v-foot">
             <template v-if="batchMode">
               <button class="ghost" @click="pickAll">{{ allPicked ? '取消全选' : '全选' }}</button>
+              <button
+                class="ghost bp-open"
+                :disabled="!pickedVersionIds.length || bpBusy"
+                :title="pickedVersionIds.length ? `把选中的 ${pickedVersionIds.length} 个版本各新建一张卡（同族自动另起基名，不动酒馆已有卡）` : '先勾选要新建到酒馆的版本'"
+                @click="openBatchPush"
+              >
+                {{ bpBusy ? `正在新建 ${bpProgress.index}/${bpProgress.total}` : `新建到酒馆 ${pickedVersionIds.length} 项` }}
+              </button>
               <button class="ghost" @click="delVersions(pickedVersionIds)">删除选中 {{ pickedVersionIds.length }} 项</button>
             </template>
             <span>共 {{ (item.versions || []).length }} 个版本，日期 {{ item.date || item.updatedAt }}</span>
           </div>
         </div>
+      </div>
+    </div>
+
+    <!-- 批量新建到酒馆：①串行进度 ②结果汇总（点按钮即开始，没有写入方式可选） -->
+    <div v-if="bpOpen" class="mask bp-mask">
+      <div class="modal bp-modal">
+        <div class="modal-head">
+          <h3>{{ bpStep === 'run' ? '正在新建到酒馆…' : '新建结果' }}</h3>
+          <button v-if="bpStep !== 'run'" class="greet-x" title="关闭" @click.stop="closeBatchPush">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M6 6l12 12M18 6L6 18" />
+            </svg>
+          </button>
+        </div>
+
+        <!-- ① 进度：第 n / 共 m 个 + 当前版本名 -->
+        <template v-if="bpStep === 'run'">
+          <div class="bp-tip bp-now">
+            第 {{ bpProgress.index }} / 共 {{ bpProgress.total }} 个<template v-if="bpProgress.versionName">
+              ：{{ bpProgress.versionName }}</template
+            >
+          </div>
+          <div class="bp-bar"><i :style="{ width: bpPercent + '%' }"></i></div>
+          <div class="bp-tip dim">每个版本各新建一张卡，同族自动另起基名，酒馆里已有的卡不会被改动。</div>
+        </template>
+
+        <!-- ② 结果汇总 -->
+        <template v-else>
+          <div class="bp-sum">
+            已新建 {{ bpCreated }} 张 · 跳过 {{ bpResult?.skipCount || 0 }} 项 · 失败
+            {{ bpResult?.failCount || 0 }} 项
+          </div>
+          <div class="bp-list">
+            <div v-for="r in bpResult?.results || []" :key="r.versionId" class="bp-row" :class="r.status">
+              <span class="bp-tag">{{ tavernBatchStatusText(r) }}</span>
+              <span class="bp-row-main">
+                <em class="bp-row-name">{{ r.versionName }}<span v-if="r.date" class="bp-row-date">｜{{ r.date }}</span></em>
+                <span class="bp-row-meta">
+                  <template v-if="r.status === 'created'">
+                    写入 {{ r.fileName || '—' }}<template v-if="r.worldFilled && r.worldName">
+                      ｜已补齐世界书「{{ r.worldName }}」</template
+                    >
+                  </template>
+                  <template v-else>{{ r.error || '—' }}</template>
+                  <template v-if="r.note">｜{{ r.note }}</template>
+                </span>
+              </span>
+            </div>
+          </div>
+          <div class="bp-foot">
+            <button class="act primary" @click="closeBatchPush">知道了</button>
+          </div>
+        </template>
       </div>
     </div>
 
@@ -1182,7 +1441,7 @@ function refreshSort() {
           <div class="greet-title">
             全部开场白
             <span class="greet-sub">
-              {{ greetVersion?.name || '' }}{{ greetVersion?.date ? '｜' + greetVersion.date : '' }}｜共 {{ greetAll.length }} 条
+              {{ greetVersion?.name || '' }}{{ greetVersion?.date ? '｜' + greetVersion.date : '' }}｜共 {{ greetView.total }} 条
             </span>
           </div>
           <button class="greet-x" title="关闭" @mousedown.stop @click.stop="closeGreet">
@@ -1191,7 +1450,12 @@ function refreshSort() {
             </svg>
           </button>
         </div>
-        <div v-if="!greetAll.length" class="empty-tip">这一版没有开场白</div>
+        <div v-if="greetView.state === 'loading'" class="empty-tip">
+          <span class="greet-spin"></span>正在读取这一版的开场白…
+        </div>
+        <div v-else-if="!greetAll.length" class="empty-tip" :class="{ 'greet-warn': greetView.state === 'unreadable' }">
+          {{ greetView.message }}
+        </div>
         <template v-else>
           <div class="greet-bar">
             <span class="greet-kind">{{ greetCur?.kind }}</span>
@@ -1209,7 +1473,7 @@ function refreshSort() {
             </div>
             <span class="greet-count">{{ greetIndex + 1 }} / {{ greetAll.length }}</span>
           </div>
-          <div class="greet-body">{{ greetCur?.text }}</div>
+          <RichText class="greet-body" :text="greetCur?.text || ''" src-font-size="12.5px" />
         </template>
       </div>
     </div>
@@ -1277,7 +1541,8 @@ function refreshSort() {
   padding: 18px 18px 24px;
   border-right: 1px solid var(--line-soft);
   overflow-y: auto;
-  background: rgba(15, 17, 20, 0.35);
+  /* 日间/夜间各有一套左侧栏底色（见 style.css 的 --side-*），不再写死深色 */
+  background: var(--side-bg);
 }
 .cover {
   position: relative;
@@ -1286,11 +1551,11 @@ function refreshSort() {
   display: grid;
   place-items: center;
   overflow: hidden;
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  box-shadow: inset 0 0 60px rgba(0, 0, 0, 0.35);
+  border: 1px solid var(--side-cover-border);
+  box-shadow: var(--side-cover-glow);
 }
 .cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
-.initial { font-size: 54px; font-weight: 600; color: rgba(255, 255, 255, 0.26); }
+.initial { font-size: 54px; font-weight: 600; color: var(--side-initial); }
 .side h2 {
   font-size: 15px;
   margin: 14px 0 8px;
@@ -1304,8 +1569,8 @@ function refreshSort() {
   font-size: 12px;
   line-height: 1.6;
   color: var(--text-2);
-  background: rgba(255, 255, 255, 0.03);
-  border: 1px dashed rgba(255, 255, 255, 0.12);
+  background: var(--side-note-bg);
+  border: 1px dashed var(--side-note-line);
   border-radius: 8px;
   padding: 6px 8px;
   margin-bottom: 8px;
@@ -1313,15 +1578,15 @@ function refreshSort() {
   word-break: break-word;
 }
 .note.empty { color: var(--muted); }
-.note:hover { border-color: rgba(255, 255, 255, 0.24); }
-.note.editing { padding: 0; border-style: solid; border-color: rgba(120, 170, 255, 0.55); background: rgba(0, 0, 0, 0.25); }
+.note:hover { border-color: var(--side-note-line-hover); }
+.note.editing { padding: 0; border-style: solid; border-color: rgba(120, 170, 255, 0.55); background: var(--side-note-edit-bg); }
 .note input {
   width: 100%;
   box-sizing: border-box;
   background: transparent;
   border: none;
   outline: none;
-  color: var(--text-1, #e8e8e8);
+  color: var(--text);
   font-size: 12px;
   line-height: 1.6;
   padding: 6px 8px;
@@ -1461,11 +1726,27 @@ function refreshSort() {
   font-weight: 600; vertical-align: 1px;
 }
 .st-cards { display: flex; flex-direction: column; gap: 5px; }
+/* 扫描失败原因（如酒馆主题目录不存在）：说明「为什么一个都没比出来」，不再是静默空白 */
+.st-warn {
+  font-size: 11.5px; color: #e0b070; line-height: 1.5;
+  padding: 5px 8px; border-radius: 6px;
+  background: rgba(224, 176, 112, 0.1); border: 1px solid rgba(224, 176, 112, 0.28);
+  word-break: break-all;
+}
 .st-card {
   display: flex; align-items: center; gap: 8px;
   font-size: 12px; color: var(--muted);
 }
-.st-card .c-name { color: var(--text-2); }
+.st-card .c-name { color: var(--text-2); display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+.st-card .c-name .bound-tag {
+  font-style: normal; font-size: 10px; padding: 0 5px; border-radius: 6px;
+  color: var(--accent-2); border: 1px solid var(--accent-2); opacity: .85;
+}
+.st-card .c-file {
+  font-size: 11px; color: var(--muted); opacity: .8;
+  max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.st-card .chip .by-tag { font-style: normal; opacity: .7; margin-left: 4px; }
 .st-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
 .act { font-size: 12px; padding: 5px 11px; }
 .chk {
@@ -1618,7 +1899,8 @@ function refreshSort() {
   padding: 7px 9px;
 }
 .op-idx { color: #6a7381; font-size: 11px; }
-.op-text { white-space: pre-wrap; word-break: break-word; }
+/* 开场白正文改由 RichText 渲染，这里只保留栅格宽度；换行交给富文本自己处理 */
+.op-text { min-width: 0; }
 .op-toggle {
   margin-top: 8px;
   font-size: 11.5px;
@@ -1626,6 +1908,22 @@ function refreshSort() {
   color: var(--text-2);
 }
 .block-body.empty { color: #5f6875; font-size: 11.5px; }
+/* 开场白 raw 预载中 / 读不到：与「确实没有」区分开，别让用户以为卡里没数据 */
+.block-body.greet-loading { display: flex; align-items: center; gap: 6px; }
+.block-body.greet-warn { color: #b4763a; }
+.greet-spin {
+  width: 10px;
+  height: 10px;
+  flex: 0 0 auto;
+  border: 1.5px solid rgba(140, 150, 165, 0.35);
+  border-top-color: rgba(90, 110, 140, 0.9);
+  border-radius: 50%;
+  display: inline-block;
+  animation: greet-spin 0.9s linear infinite;
+}
+@keyframes greet-spin {
+  to { transform: rotate(360deg); }
+}
 
 /* 弹层 */
 .mask {
@@ -1655,6 +1953,54 @@ function refreshSort() {
 }
 .modal-head h3 { font-size: 13.5px; margin: 0; }
 .empty-tip { font-size: 12.5px; color: var(--muted); line-height: 1.8; padding: 10px 2px; }
+
+/* ---------- 批量新建到酒馆（进度 / 汇总） ---------- */
+.bp-mask { z-index: 70; }
+.bp-modal { width: min(560px, 92%); max-height: 78%; }
+.bp-tip { font-size: 12px; color: var(--muted); line-height: 1.7; margin-bottom: 10px; }
+.bp-tip.dim { margin: 8px 0 0; opacity: 0.8; }
+.bp-now { font-size: 12.5px; color: var(--text); margin-bottom: 0; }
+.bp-bar {
+  height: 6px;
+  margin-top: 10px;
+  border-radius: 4px;
+  background: var(--bg-2);
+  border: 1px solid var(--line-soft);
+  overflow: hidden;
+}
+.bp-bar i { display: block; height: 100%; background: var(--gold, #d4a24c); transition: width 0.2s linear; }
+.bp-sum { font-size: 12.5px; color: var(--text); margin-bottom: 10px; }
+.bp-list { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 7px; min-height: 60px; }
+.bp-row {
+  display: flex;
+  gap: 9px;
+  padding: 8px 10px;
+  border-radius: 9px;
+  background: var(--bg-2);
+  border: 1px solid var(--line-soft);
+}
+.bp-row.created { border-color: rgba(90, 180, 120, 0.32); }
+.bp-row.skipped { opacity: 0.75; }
+.bp-row.failed { border-color: rgba(220, 90, 90, 0.38); }
+.bp-tag {
+  flex-shrink: 0;
+  height: 18px;
+  padding: 1px 7px;
+  font-size: 11px;
+  line-height: 16px;
+  border-radius: 5px;
+  color: var(--text-2);
+  background: var(--panel-3);
+  border: 1px solid var(--line-soft);
+}
+.bp-row.created .bp-tag { color: #7fd39a; }
+.bp-row.failed .bp-tag { color: #e88; }
+.bp-row-main { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.bp-row-name { font-size: 12.5px; color: var(--text); font-style: normal; }
+.bp-row-date { font-size: 11.5px; font-weight: 400; color: var(--muted); }
+.bp-row-meta { font-size: 11.5px; color: var(--muted); line-height: 1.6; word-break: break-all; }
+.bp-foot { display: flex; gap: 8px; justify-content: flex-end; margin-top: 12px; }
+.bp-open:disabled { opacity: 0.5; cursor: default; }
 
 /* 全部开场白弹层 */
 .greet-mask {
@@ -1740,6 +2086,7 @@ function refreshSort() {
 .pg:disabled { opacity: 0.55; cursor: default; }
 .greet-body {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
   margin-top: 12px;
   padding: 14px 16px;
@@ -1749,8 +2096,6 @@ function refreshSort() {
   font-size: 13px;
   line-height: 1.9;
   color: var(--text-2);
-  white-space: pre-wrap;
-  word-break: break-word;
 }
 .wb-list { overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
 .wb-row {

@@ -16,7 +16,7 @@ let port = 0
 let seq = 0
 let lastError = ''
 let starting = null
-let last = { action: 'idle', avatar: '', name: '', world: '', preset: '', at: 0 }
+let last = { action: 'idle', avatar: '', name: '', world: '', preset: '', engine: '', at: 0 }
 /* 扩展心跳：扩展每轮 /pending 命中就记一次时间（只记时间，不累加计数）
  * 用于判断「酒馆里的扩展是否还在正常轮询」，而不是「酒馆是否开着我」 */
 const EXT_ONLINE_MS = 8000
@@ -108,6 +108,7 @@ function handle(req, res) {
       name: last.name,
       world: last.world,
       preset: last.preset,
+      engine: last.engine,
       at: last.at
     })
     return
@@ -225,6 +226,7 @@ function notify(payload = {}) {
     name: payload.name || '',
     world: payload.world || '',
     preset: payload.preset || '',
+    engine: payload.engine || '',
     at: Date.now()
   }
   return { ok: true, seq, port }

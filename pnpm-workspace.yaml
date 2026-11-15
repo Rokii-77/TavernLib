@@ -2,3 +2,5 @@
   electron: true
   esbuild: true
 
+minimumReleaseAgeExclude:
+  - dompurify@3.4.18

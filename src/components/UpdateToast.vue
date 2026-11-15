@@ -111,22 +111,31 @@ onMounted(() => {
       </div>
     </transition>
 
-    <!-- 酒馆扩展版本不匹配：更新完第一次打开就要提醒，否则酒馆里跑的旧扩展会静默出错 -->
+    <!-- 酒馆扩展版本比对（每次启动自动跑一次）：内置比酒馆里的新 → 提示可升级；
+         版本对不上也提示，但只引导重新注入，绝不自动覆盖、不弹窗打断 -->
     <transition name="pop">
       <div v-if="ext.visible" class="card ext">
         <div class="head">
-          <b>{{ ext.installed ? '酒馆扩展版本不匹配' : '酒馆里还没装扩展' }}</b>
+          <b v-if="ext.state === 'upgrade'">酒馆扩展可升级到 v{{ ext.builtin }}</b>
+          <b v-else-if="!ext.installed">酒馆里还没装扩展</b>
+          <b v-else>酒馆扩展版本不匹配</b>
           <button class="x" title="稍后再说" @click="onLaterExt">✕</button>
         </div>
         <p class="line">
-          <template v-if="ext.installed">
+          <template v-if="ext.state === 'upgrade'">
+            酒馆里跑的还是 <i>v{{ ext.tavern }}</i>，软件内置已经到 <i>v{{ ext.builtin }}</i>。重新注入一次就能升级，不用自己去翻扩展目录。
+          </template>
+          <template v-else-if="ext.state === 'newer'">
+            酒馆里是 <i>v{{ ext.tavern }}</i>，比软件内置的 <i>v{{ ext.builtin }}</i> 还新，保持现状即可，不用重新注入。
+          </template>
+          <template v-else-if="ext.installed">
             软件内置 <i>v{{ ext.builtin || '?' }}</i>，酒馆里是 <i>v{{ ext.tavern || '未知' }}</i>。重新注入一次才能对上。
           </template>
           <template v-else>酒馆目录里没有 tavernlib-sync，重新注入后酒馆才能读到资料库。</template>
         </p>
         <div class="acts">
-          <button class="primary" :disabled="ext.busy" @click="onReInject">
-            {{ ext.busy ? '注入中…' : '立即重新注入' }}
+          <button v-if="ext.state !== 'newer'" class="primary" :disabled="ext.busy" @click="onReInject">
+            {{ ext.busy ? '注入中…' : (ext.state === 'upgrade' ? '注入新版 v' + ext.builtin : '立即重新注入') }}
           </button>
           <button class="ghost" :disabled="ext.busy" @click="onLaterExt">稍后</button>
         </div>
